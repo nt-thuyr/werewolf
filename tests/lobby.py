@@ -116,6 +116,8 @@ def recv_frame(sock):
 
 def test_wire():
     with socket.create_connection(ADDRESS, timeout=12) as peer:
+        peer.sendall(frame(1, 0, b"wire"))
+        assert recv_frame(peer) == (0xFF, 0, 8, b"")
         peer.sendall(frame(2, 10))
         assert recv_frame(peer) == (0xFF, 10, 1, b"")
         for byte in frame(1, 11, b"wire"):

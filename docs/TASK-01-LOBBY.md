@@ -10,7 +10,11 @@
 
 Header 8 byte, theo thứ tự `msg_type:u8` (offset 0), `length:u16` (1), `request_id:u32` (3), `status_code:u8` (7). `length` chỉ đếm body, tối đa 4096 byte như mã hiện tại. `u8/u16/u32` lần lượt là 1/2/4 byte. Mọi số nhiều byte dùng big-endian. Mã hóa từng trường, không gửi nguyên struct C. Request có status 0. `max_players` từ 5 đến 12, tính cả Host. Phòng chờ có thể có ít hơn 5 thành viên.
 
-`Name` gồm `len:u8` và đúng `len` byte tên, với `1 ≤ len ≤ 32`, giữ nguyên byte và không chứa NUL. `RoomInfo` và `PlayerEntry` dùng bố cục dưới đây. Client gửi request với ID khác 0 và không trùng yêu cầu đang chờ trên cùng socket. Phản hồi lặp đúng ID của request. `ROOM_UPDATE` có ID 0 và status 0, không hoàn tất yêu cầu đang chờ. LOGIN dùng tên thô làm body của request và body rỗng trong phản hồi. Server cấp ID phiên sau LOGIN thành công. Client tìm ID của mình trong `ROOM_UPDATE` bằng username duy nhất, so sánh theo byte như LOGIN.
+`Name` gồm `len:u8` và đúng `len` byte tên, với `1 ≤ len ≤ 32`, giữ nguyên byte và không chứa NUL. `RoomInfo` và `PlayerEntry` dùng bố cục dưới đây.
+
+Mọi yêu cầu từ client, kể cả `LOGIN`, phải có `request_id` khác `0` và không trùng ID của yêu cầu đang chờ trên cùng socket. Phản hồi giữ nguyên `request_id` của yêu cầu gốc. `ROOM_UPDATE` là thông báo đẩy có `request_id = 0` và `status_code = 0`.
+
+`LOGIN` dùng tên thô làm body của request và body rỗng trong phản hồi. Client gửi `request_id = 1` cho `LOGIN`. Sau khi đăng nhập thành công, server cấp ID phiên. Client tìm ID của mình trong `ROOM_UPDATE` bằng username duy nhất, so sánh theo byte như `LOGIN`.
 
 | Nhóm | Chiều và mã | Body theo thứ tự | Phản hồi và hiệu ứng |
 | --- | --- | --- | --- |
@@ -23,13 +27,13 @@ Header 8 byte, theo thứ tự `msg_type:u8` (offset 0), `length:u16` (1), `requ
 
 | Status | Khi trả |
 | --- | --- |
-| `0x08 ERR_INVALID_PAYLOAD` | Sai loại/chiều thông điệp, status request khác 0, ID request phòng chờ bằng 0, body thiếu/thừa byte, tên sai định dạng hoặc sức chứa ngoài 5–12. |
+| `0x08 ERR_INVALID_PAYLOAD` | Sai loại/chiều thông điệp, status request khác 0, `request_id` bằng 0, body thiếu/thừa byte, tên sai định dạng hoặc sức chứa ngoài 5–12. |
 | `0x01 ERR_UNAUTHENTICATED` | Gửi LIST/CREATE/JOIN hợp lệ trước LOGIN. |
 | `0x02 ERR_UNAUTHORIZED` | Gửi LIST/CREATE/JOIN hợp lệ khi phiên đã ở trong phòng. |
 | `0x09 ERR_ROOM_NOT_FOUND` | JOIN từ sảnh với ID không tồn tại. |
 | `0x05 ERR_ROOM_FULL` | JOIN từ sảnh vào phòng đã đủ chỗ. |
 
-Lỗi lệnh không đổi trạng thái phòng và không phát push cho lệnh thất bại. Nếu client phòng chờ gửi ID 0 sai quy ước, phản hồi lỗi vẫn có type `0xFF`, không phải push. Server đóng riêng kết nối nếu `length > 4096` hoặc khung dở quá 10 giây. Sau 5 frame lỗi liên tiếp, gửi phản hồi lỗi cuối rồi đóng. Các mã lỗi nghiệp vụ không tính là frame lỗi.
+Lệnh thất bại không đổi trạng thái phòng và không phát thông báo đẩy. Với yêu cầu có ID `0`, server trả `MSG_RESPONSE (0xFF)` với ID `0` và status `0x08` mà không thực hiện lệnh. Client phân biệt phản hồi lỗi với `ROOM_UPDATE` bằng `msg_type`. Server đóng riêng kết nối nếu `length > 4096` hoặc khung dở quá 10 giây. Sau 5 frame lỗi liên tiếp, gửi phản hồi lỗi cuối rồi đóng. Các mã lỗi nghiệp vụ không tính là frame lỗi.
 
 Các gói mẫu dùng để kiểm tra codec và ghép phản hồi:
 

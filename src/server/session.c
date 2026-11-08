@@ -252,14 +252,11 @@ static uint8_t handle_request(struct lobby *lobby, struct session *session,
                               const struct message_header *header)
 {
     const uint8_t *body = session->input + PROTOCOL_HEADER_SIZE;
-    if (header->status != 0) {
+    if (header->status != 0 || header->request_id == 0) {
         return ERR_INVALID_PAYLOAD;
     }
     if (header->type == MSG_LOGIN_REQ) {
         return login(lobby, session, body, header->length);
-    }
-    if (header->request_id == 0) {
-        return ERR_INVALID_PAYLOAD;
     }
 
     char name[PROTOCOL_MAX_NAME + 1];
