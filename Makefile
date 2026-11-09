@@ -9,10 +9,10 @@ COMMON_HEADERS := include/net_config.h include/protocol.h
 
 all: $(BUILD_DIR)/server $(BUILD_DIR)/client
 
-$(BUILD_DIR)/server: src/server/main.c src/server/session.c src/server/session.h $(COMMON_SOURCE) $(COMMON_HEADERS) | $(BUILD_DIR)
+$(BUILD_DIR)/server: src/server/main.c src/server/session.c include/server/session.h src/server/lobby.c include/server/lobby.h $(COMMON_SOURCE) $(COMMON_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
-$(BUILD_DIR)/client: src/client/main.c $(COMMON_SOURCE) $(COMMON_HEADERS) | $(BUILD_DIR)
+$(BUILD_DIR)/client: src/client/main.c src/client/lobby.c include/client/lobby.h $(COMMON_SOURCE) $(COMMON_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 $(BUILD_DIR):

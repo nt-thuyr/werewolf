@@ -1,5 +1,5 @@
 #include "net_config.h"
-#include "session.h"
+#include "server/session.h"
 
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -52,6 +52,7 @@ int main(int argc, char *argv[])
 
     printf("Listening on %s:%d\n", bind_ip, WEREWOLF_PORT);
     fflush(stdout);
+    // Chuyển socket lắng nghe cho vòng lặp quản lý phiên.
     int result = serve_sessions(listener);
     close(listener);
     return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

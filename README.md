@@ -5,7 +5,9 @@ Trò chơi Ma Sói qua TCP, viết bằng C cho Linux. Bản hiện tại hỗ t
 ## Cấu trúc dự án
 
 - `src/` chứa mã nguồn server, client và phần giao thức dùng chung.
-- `include/` chứa các header dùng chung.
+  - `src/client/main.c` kết nối và đăng nhập; `lobby.c` xử lý lệnh và cập nhật phòng chờ.
+  - `src/server/session.c` quản lý phiên và I/O; `lobby.c` quản lý phòng và thành viên.
+- `include/` chứa header dùng chung; `include/client/` và `include/server/` chứa header riêng của từng phía.
 - `docs/` chứa [kế hoạch và phân công](docs/PLAN.md), [ghi chú triển khai](docs/DEVELOPMENT.md) và [đặc tả Task 1](docs/TASK-01-LOBBY.md).
 
 ## Cài đặt
