@@ -226,6 +226,95 @@ def login_peer(stack, username):
     return peer
 
 
+def expect_room_members(peer, names):
+    kind, request_id, status, body = recv_frame(peer)
+    assert (kind, request_id, status) == (7, 0, 0)
+    room_id, host_id, count = struct.unpack_from("!IIB", body)
+    offset = 9
+    members = {}
+    for _ in range(count):
+        player_id, size = struct.unpack_from("!IB", body, offset)
+        offset += 5
+        members[body[offset:offset + size]] = player_id
+        offset += size
+    assert offset == len(body) and list(members) == names
+    assert host_id == members[names[0]]
+    return room_id, members
+
+
+def test_room_administration():
+    with ExitStack() as stack:
+        host = login_peer(stack, b"host")
+        member = login_peer(stack, b"member")
+        invited = login_peer(stack, b"invited")
+        anonymous = stack.enter_context(socket.create_connection(ADDRESS, timeout=4))
+
+        def request(peer, kind, request_id, body=b"", status=0):
+            peer.sendall(frame(kind, request_id, body))
+            assert recv_frame(peer) == (0xFF, request_id, status, b"")
+
+        request(anonymous, 6, 1, status=1)
+        request(anonymous, 0x10, 2, b"\x07invited", status=1)
+        request(anonymous, 0x12, 3, struct.pack("!I", 1), status=1)
+        request(invited, 6, 2, status=2)
+        request(host, 4, 2, b"\x04room\x05")
+        room_id, _ = expect_room_members(host, [b"host"])
+        room_bytes = struct.pack("!I", room_id)
+
+        request(host, 6, 3, b"\x00", status=8)
+        request(host, 0x10, 4, b"\x07invited\x00", status=8)
+        request(host, 0x12, 5, b"\x00", status=8)
+        request(host, 0x10, 6, b"\x07missing", status=4)
+        request(member, 0x10, 2, b"\x07invited", status=2)
+        request(host, 0x10, 7, b"\x07invited")
+        assert recv_frame(invited) == (0x11, 0, 0, room_bytes + b"\x04host")
+
+        request(member, 5, 3, room_bytes)
+        names = [b"host", b"member"]
+        expect_room_members(host, names)
+        expect_room_members(member, names)
+        request(invited, 5, 3, room_bytes)
+        names.append(b"invited")
+        for peer in (host, member, invited):
+            current_room, players = expect_room_members(peer, names)
+            assert current_room == room_id
+
+        host_bytes = struct.pack("!I", players[b"host"])
+        invited_bytes = struct.pack("!I", players[b"invited"])
+        request(host, 0x10, 8, b"\x06member", status=4)
+        request(member, 0x12, 4, host_bytes, status=2)
+        request(host, 0x12, 9, host_bytes, status=4)
+        request(host, 0x12, 10, b"\x00\x00\x00\x00", status=4)
+        request(host, 0x12, 11, invited_bytes)
+        assert recv_frame(invited) == (0x13, 0, 0, b"\x01")
+        expect_room_members(host, names[:2])
+        expect_room_members(member, names[:2])
+
+        # Phiên bị loại vẫn ở sảnh và có thể vào lại bằng JOIN.
+        request(invited, 5, 4, room_bytes)
+        for peer in (host, member, invited):
+            expect_room_members(peer, names)
+        request(invited, 6, 5)
+        expect_room_members(host, names[:2])
+        expect_room_members(member, names[:2])
+        request(invited, 5, 6, room_bytes)
+        for peer in (host, member, invited):
+            expect_room_members(peer, names)
+
+        request(host, 6, 12)
+        for peer in (member, invited):
+            expect_room_members(peer, names[1:])
+        request(host, 0x12, 13, invited_bytes, status=2)
+        request(member, 0x10, 5, b"\x04host")
+        assert recv_frame(host) == (0x11, 0, 0, room_bytes + b"\x06member")
+        request(invited, 6, 7)
+        expect_room_members(member, [b"member"])
+        request(member, 6, 6)
+        host.sendall(frame(2, 14))
+        assert recv_frame(host) == (3, 14, 0, b"\x00\x00")
+    print("PASS: invite, kick, leave, authorization and host transfer")
+
+
 def test_room_capacity_and_display():
     with ExitStack() as stack:
         host = login_peer(stack, b"host\n\x1b")
@@ -318,6 +407,7 @@ def main():
         test_protocol_samples()
         test_wire(server)
         test_room_capacity_and_display()
+        test_room_administration()
         assert server.poll() is None
         deadline = time.monotonic() + 4
         while len(os.listdir(descriptors)) != initial_count:

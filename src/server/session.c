@@ -105,12 +105,10 @@ void session_queue_message(struct session *session, struct message_header header
 
 static void close_session(struct pollfd *slot, struct session *session)
 {
-    struct room *room = session->room;
     close(slot->fd);
     slot->fd = -1;
+    lobby_remove_session(session);
     *session = (struct session){0};
-    // Gỡ thành viên sau khi đóng và xóa trạng thái phiên.
-    lobby_remove_session(room, session);
 }
 
 static void close_failed_sessions(struct pollfd *slots, struct lobby *lobby)
@@ -155,7 +153,8 @@ static uint8_t login(struct lobby *lobby, struct session *session,
 }
 
 static uint8_t handle_request(struct lobby *lobby, struct session *session,
-                              const struct message_header *header)
+                              const struct message_header *header,
+                              struct session **target)
 {
     const uint8_t *body = session->input + PROTOCOL_HEADER_SIZE;
     if (header->status != 0 || header->request_id == 0) {
@@ -165,21 +164,21 @@ static uint8_t handle_request(struct lobby *lobby, struct session *session,
         return login(lobby, session, body, header->length);
     }
 
-    return lobby_handle_request(lobby, session, header);
+    return lobby_handle_request(lobby, session, header, target);
 }
 
 static bool read_request(int fd, struct lobby *lobby, struct session *session,
                          int64_t now, int log_fd)
 {
     struct message_header header;
-    size_t target = PROTOCOL_HEADER_SIZE;
+    size_t target_size = PROTOCOL_HEADER_SIZE;
     if (session->received >= PROTOCOL_HEADER_SIZE) {
         protocol_decode_header(&header, session->input);
-        target += header.length;
+        target_size += header.length;
     }
 
     ssize_t count = recv(fd, session->input + session->received,
-                         target - session->received, 0);
+                         target_size - session->received, 0);
     if (count <= 0) {
         return count < 0 && (errno == EINTR || errno == EAGAIN ||
                              errno == EWOULDBLOCK);
@@ -206,7 +205,8 @@ static bool read_request(int fd, struct lobby *lobby, struct session *session,
     }
 
     // Chỉ xử lý yêu cầu khi đã nhận đủ một khung.
-    uint8_t status = handle_request(lobby, session, &header);
+    struct session *target = NULL;
+    uint8_t status = handle_request(lobby, session, &header, &target);
     if (status == ERR_INVALID_PAYLOAD) {
         ++session->invalid_frames;
     } else {
@@ -223,9 +223,8 @@ static bool read_request(int fd, struct lobby *lobby, struct session *session,
             .status = status
         };
         session_queue_message(session, reply, NULL);
-        if (status == ERR_SUCCESS &&
-            (header.type == MSG_CREATE_ROOM_REQ || header.type == MSG_JOIN_ROOM_REQ)) {
-            lobby_broadcast_room(session->room);
+        if (status == ERR_SUCCESS) {
+            lobby_finish_request(session, header.type, target);
         }
     }
     session->received = 0;

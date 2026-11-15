@@ -18,11 +18,14 @@ struct lobby {
     uint32_t next_room_id;
 };
 
-void lobby_broadcast_room(const struct room *room);
-void lobby_remove_session(struct room *room, struct session *session);
+void lobby_remove_session(struct session *session);
 void lobby_list_rooms(const struct lobby *lobby, struct session *session,
                       uint32_t request_id);
 uint8_t lobby_handle_request(struct lobby *lobby, struct session *session,
-                             const struct message_header *header);
+                             const struct message_header *header,
+                             struct session **target);
+// Gọi sau khi đã xếp phản hồi thành công để giữ thứ tự thông báo trên TCP.
+void lobby_finish_request(struct session *session, uint8_t type,
+                          struct session *target);
 
 #endif
