@@ -117,6 +117,42 @@ def recv_frame(sock):
     return kind, request_id, status, bytes(recv_exact(sock, size))
 
 
+def forward_sample(source, destination, expected):
+    data = recv_exact(source, len(expected))
+    assert data == expected, f"Expected {expected.hex(' ')}, got {data.hex(' ')}"
+    destination.sendall(data)
+
+
+def test_protocol_samples():
+    login_request = bytes.fromhex("01 00 05 00 00 00 01 00 61 6C 69 63 65")
+    login_response = bytes.fromhex("FF 00 00 00 00 00 01 00")
+    list_request = bytes.fromhex("02 00 00 00 00 00 02 00")
+    list_response = bytes.fromhex("03 00 02 00 00 00 02 00 00 00")
+    relay_address = ("127.0.0.2", ADDRESS[1])
+    with ExitStack() as stack:
+        relay = stack.enter_context(socket.create_server(relay_address))
+        relay.settimeout(4)
+        client = launch(stack, "./build/client", relay_address[0], "alice")
+        client_peer, _ = relay.accept()
+        stack.enter_context(client_peer)
+        client_peer.settimeout(4)
+        server_peer = stack.enter_context(socket.create_connection(ADDRESS, timeout=4))
+
+        forward_sample(client_peer, server_peer, login_request)
+        forward_sample(server_peer, client_peer, login_response)
+        assert b"Logged in as alice" in wait_output(client, b"> ")
+
+        # LIST bắt đầu ngay sau LOGIN trên cùng dòng byte ở mỗi chiều.
+        command(client, "list")
+        forward_sample(client_peer, server_peer, list_request)
+        forward_sample(server_peer, client_peer, list_response)
+        assert b"Rooms: 0" in wait_output(client, b"> ")
+
+        client.stdin.close()
+        assert client.wait(timeout=4) == 0
+    print("PASS: client and server match the documented LOGIN and LIST bytes")
+
+
 def test_wire(server):
     with socket.create_connection(ADDRESS, timeout=12) as peer:
         peer.sendall(frame(1, 0, b"wire"))
@@ -279,6 +315,7 @@ def main():
         descriptors = f"/proc/{server.pid}/fd"
         initial_count = len(os.listdir(descriptors))
         test_demo()
+        test_protocol_samples()
         test_wire(server)
         test_room_capacity_and_display()
         assert server.poll() is None
