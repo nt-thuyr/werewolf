@@ -1,5 +1,6 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
+#include "net_config.h"
 #include "server/session.h"
 #include "server/lobby.h"
 #include "protocol.h"
@@ -7,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,8 +18,49 @@
 
 enum {
     MAX_INVALID_FRAMES = 5,
-    FRAME_TIMEOUT_MS = 10000
+    FRAME_TIMEOUT_MS = 10000,
+    ACCEPT_RETRY_MS = 250
 };
+
+static volatile sig_atomic_t stop_requested;
+
+static void request_stop(int signal_number)
+{
+    (void)signal_number;
+    stop_requested = 1;
+}
+
+static int prepare_signals(sigset_t *wait_mask)
+{
+    sigset_t stop_signals;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGINT);
+    sigaddset(&stop_signals, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &stop_signals, wait_mask) == -1) {
+        return -1;
+    }
+    sigdelset(wait_mask, SIGINT);
+    sigdelset(wait_mask, SIGTERM);
+
+    struct sigaction action = {.sa_handler = request_stop};
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGINT, &action, NULL) == -1 ||
+        sigaction(SIGTERM, &action, NULL) == -1) {
+        return -1;
+    }
+    action.sa_handler = SIG_IGN;
+    return sigaction(SIGPIPE, &action, NULL);
+}
+
+static void log_frame_error(int log_fd, const char *message)
+{
+    size_t length = strlen(message);
+    if (log_fd != -1) {
+        (void)write(log_fd, message, length);
+    } else {
+        (void)send(STDERR_FILENO, message, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+}
 
 static int64_t monotonic_ms(void)
 {
@@ -126,7 +169,7 @@ static uint8_t handle_request(struct lobby *lobby, struct session *session,
 }
 
 static bool read_request(int fd, struct lobby *lobby, struct session *session,
-                         int64_t now)
+                         int64_t now, int log_fd)
 {
     struct message_header header;
     size_t target = PROTOCOL_HEADER_SIZE;
@@ -151,8 +194,11 @@ static bool read_request(int fd, struct lobby *lobby, struct session *session,
 
     protocol_decode_header(&header, session->input);
     if (header.length > PROTOCOL_MAX_BODY) {
-        fprintf(stderr, "Closing fd %d: frame body length %u exceeds %d bytes\n",
-                fd, (unsigned)header.length, PROTOCOL_MAX_BODY);
+        char message[96];
+        snprintf(message, sizeof message,
+                 "Closing fd %d: frame body length %u exceeds %d bytes\n",
+                 fd, (unsigned)header.length, PROTOCOL_MAX_BODY);
+        log_frame_error(log_fd, message);
         return false;
     }
     if (session->received < (size_t)PROTOCOL_HEADER_SIZE + header.length) {
@@ -205,24 +251,26 @@ static bool write_reply(int fd, struct session *session)
     return true;
 }
 
-static void accept_session(struct pollfd *slots)
+static bool accept_session(int listener, struct pollfd *slots)
 {
-    int client = accept(slots[0].fd, NULL, NULL);
+    int client = accept(listener, NULL, NULL);
     if (client == -1) {
-        return;
+        return errno != EMFILE && errno != ENFILE &&
+               errno != ENOBUFS && errno != ENOMEM;
     }
     if (set_nonblocking(client) == 0) {
         for (size_t i = 1; i <= MAX_SESSIONS; ++i) {
             if (slots[i].fd == -1) {
                 slots[i].fd = client;
-                return;
+                return true;
             }
         }
     }
     close(client);
+    return true;
 }
 
-int serve_sessions(int listener)
+int serve_sessions(int listener, const char *bind_ip)
 {
     struct pollfd slots[MAX_SESSIONS + 1] = {{.fd = listener, .events = POLLIN}};
     struct lobby lobby = {.next_session_id = 1, .next_room_id = 1};
@@ -233,15 +281,35 @@ int serve_sessions(int listener)
         perror("fcntl");
         return -1;
     }
+    sigset_t wait_mask;
+    if (prepare_signals(&wait_mask) == -1) {
+        perror("signal setup");
+        return -1;
+    }
+    // Mở mô tả riêng để không đổi cờ I/O của stderr được kế thừa.
+    int log_fd = open("/proc/self/fd/2", O_WRONLY | O_NONBLOCK | O_APPEND | O_CLOEXEC);
+    printf("Listening on %s:%d\n", bind_ip, WEREWOLF_PORT);
+    fflush(stdout);
 
-    for (;;) {
+    int64_t accept_retry_at = 0;
+    while (!stop_requested) {
         int64_t now = monotonic_ms();
         if (now < 0) {
             perror("clock_gettime");
             break;
         }
         int timeout = -1;
+        slots[0].fd = listener;
+        if (now < accept_retry_at) {
+            slots[0].fd = -1;
+            timeout = (int)(accept_retry_at - now);
+        }
+        nfds_t count = 1;
         for (size_t i = 1; i <= MAX_SESSIONS; ++i) {
+            if (slots[i].fd == -1) {
+                continue;
+            }
+            count = i + 1;
             struct session *session = &lobby.sessions[i - 1];
             slots[i].events = session->queued != 0 ? POLLOUT : POLLIN;
             if (session->deadline_ms != 0) {
@@ -254,7 +322,16 @@ int serve_sessions(int listener)
             }
         }
 
-        if (poll(slots, MAX_SESSIONS + 1, timeout) == -1) {
+        struct timespec wait_time = {
+            .tv_sec = timeout < 0 ? 0 : timeout / 1000,
+            .tv_nsec = timeout < 0 ? 0 : (timeout % 1000) * 1000000L
+        };
+        // Bỏ chặn tín hiệu cùng lúc bắt đầu chờ, tránh bỏ lỡ tín hiệu dừng.
+        int ready = ppoll(slots, count, timeout < 0 ? NULL : &wait_time, &wait_mask);
+        if (stop_requested) {
+            break;
+        }
+        if (ready == -1) {
             if (errno == EINTR) {
                 continue;
             }
@@ -266,7 +343,7 @@ int serve_sessions(int listener)
             perror("clock_gettime");
             break;
         }
-        for (size_t i = 1; i <= MAX_SESSIONS; ++i) {
+        for (size_t i = 1; i < count; ++i) {
             struct pollfd *slot = &slots[i];
             struct session *session = &lobby.sessions[i - 1];
             if (slot->fd == -1 || session->closing) {
@@ -274,14 +351,17 @@ int serve_sessions(int listener)
             }
             short events = slot->revents;
             if (session->deadline_ms != 0 && now >= session->deadline_ms) {
-                fprintf(stderr, "Closing fd %d: incomplete frame timed out\n", slot->fd);
+                char message[80];
+                snprintf(message, sizeof message,
+                         "Closing fd %d: incomplete frame timed out\n", slot->fd);
+                log_frame_error(log_fd, message);
                 session->closing = true;
             } else if (events & (POLLERR | POLLNVAL)) {
                 session->closing = true;
             } else if (session->queued != 0 && (events & POLLOUT)) {
                 session->closing = !write_reply(slot->fd, session);
             } else if (session->queued == 0 && (events & POLLIN)) {
-                if (!read_request(slot->fd, &lobby, session, now)) {
+                if (!read_request(slot->fd, &lobby, session, now, log_fd)) {
                     session->closing = true;
                 }
             } else if (events & POLLHUP) {
@@ -294,8 +374,8 @@ int serve_sessions(int listener)
             fputs("Listening socket failed\n", stderr);
             break;
         }
-        if (slots[0].revents & POLLIN) {
-            accept_session(slots);
+        if ((slots[0].revents & POLLIN) && !accept_session(listener, slots)) {
+            accept_retry_at = now + ACCEPT_RETRY_MS;
         }
     }
 
@@ -304,5 +384,8 @@ int serve_sessions(int listener)
             close(slots[i].fd);
         }
     }
-    return -1;
+    if (log_fd != -1) {
+        close(log_fd);
+    }
+    return stop_requested ? 0 : -1;
 }

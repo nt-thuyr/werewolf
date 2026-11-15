@@ -5,12 +5,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <locale.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <wchar.h>
+#include <wctype.h>
 
 enum {
     MAX_COMMAND = 128,
@@ -115,6 +118,30 @@ static void queue_command(struct client *client)
     client->sent = 0;
 }
 
+static void print_name(const char *name)
+{
+    mbstate_t state = {0};
+    size_t remaining = strlen(name);
+    while (remaining != 0) {
+        wchar_t character;
+        size_t width = mbrtowc(&character, name, remaining, &state);
+        if (width == (size_t)-1 || width == (size_t)-2) {
+            state = (mbstate_t){0};
+            width = 1;
+        } else if (iswprint(character) && character != L'\\') {
+            fwrite(name, 1, width, stdout);
+            name += width;
+            remaining -= width;
+            continue;
+        }
+        for (size_t i = 0; i < width; ++i) {
+            printf("\\x%02x", (unsigned)(unsigned char)name[i]);
+        }
+        name += width;
+        remaining -= width;
+    }
+}
+
 static bool print_room_list(const uint8_t *body, size_t length)
 {
     if (length < 2) {
@@ -140,7 +167,9 @@ static bool print_room_list(const uint8_t *body, size_t length)
             capacity < PROTOCOL_MIN_PLAYERS || capacity > PROTOCOL_MAX_PLAYERS) {
             return false;
         }
-        printf("  room_id=%" PRIu32 " %s (%u/%u)\n", id, name, players, capacity);
+        printf("  room_id=%" PRIu32 " ", id);
+        print_name(name);
+        printf(" (%u/%u)\n", players, capacity);
     }
     return offset == length;
 }
@@ -184,7 +213,9 @@ static bool update_room(struct client *client, const uint8_t *body, size_t lengt
            room.id, room.host_id, room.self_id);
     for (size_t i = 0; i < client->room.count; ++i) {
         const struct player *player = &client->room.players[i];
-        printf("  %" PRIu32 " %s\n", player->id, player->name);
+        printf("  %" PRIu32 " ", player->id);
+        print_name(player->name);
+        putchar('\n');
     }
     return true;
 }
@@ -323,6 +354,7 @@ static int read_command(struct client *client)
 
 int run_lobby(int fd, const char *username)
 {
+    setlocale(LC_CTYPE, "");
     int flags = fcntl(fd, F_GETFL);
     if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
         perror("fcntl");

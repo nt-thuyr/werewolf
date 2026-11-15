@@ -28,6 +28,6 @@ struct session {
 // Xếp phản hồi vào bộ đệm gửi của phiên.
 void session_queue_message(struct session *session, struct message_header header,
                            const uint8_t *body);
-int serve_sessions(int listener);
+int serve_sessions(int listener, const char *bind_ip);
 
 #endif

@@ -50,10 +50,8 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    printf("Listening on %s:%d\n", bind_ip, WEREWOLF_PORT);
-    fflush(stdout);
     // Chuyển socket lắng nghe cho vòng lặp quản lý phiên.
-    int result = serve_sessions(listener);
+    int result = serve_sessions(listener, bind_ip);
     close(listener);
     return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

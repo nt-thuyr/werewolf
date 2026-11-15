@@ -1,5 +1,8 @@
+import fcntl
 import os
+import resource
 import selectors
+import signal
 import socket
 import struct
 import subprocess
@@ -180,6 +183,95 @@ def test_wire(server):
     print("PASS: split and 100 coalesced frames, invalid input, timeout and reset isolation")
 
 
+def login_peer(stack, username):
+    peer = stack.enter_context(socket.create_connection(ADDRESS, timeout=4))
+    peer.sendall(frame(1, 1, username))
+    assert recv_frame(peer) == (0xFF, 1, 0, b"")
+    return peer
+
+
+def test_room_capacity_and_display():
+    with ExitStack() as stack:
+        host = login_peer(stack, b"host\n\x1b")
+        room_name = b"room\r\x1b"
+        host.sendall(frame(4, 2, bytes([len(room_name)]) + room_name + b"\x05"))
+        assert recv_frame(host) == (0xFF, 2, 0, b"")
+        kind, _, _, snapshot = recv_frame(host)
+        assert kind == 7
+        target = snapshot[:4]
+        room_id = struct.unpack("!I", target)[0]
+        viewer = launch(stack, "./build/client", ADDRESS[0], "viewer")
+        wait_output(viewer, b"> ")
+        command(viewer, "list")
+        assert b"room\\x0d\\x1b (1/5)" in wait_output(viewer, b"> ")
+        command(viewer, f"join {room_id}")
+        wait_output(viewer, b"host\\x0a\\x1b")
+
+        for index in range(3):
+            member = login_peer(stack, f"member{index}".encode())
+            member.sendall(frame(5, 2, target))
+            assert recv_frame(member) == (0xFF, 2, 0, b"")
+        extra = login_peer(stack, b"extra")
+        extra.sendall(frame(5, 2, target) + frame(2, 3))
+        assert recv_frame(extra) == (0xFF, 2, 5, b"")
+        expected = b"\x00\x01" + target + bytes([len(room_name)]) + room_name + b"\x05\x05"
+        assert recv_frame(extra) == (3, 3, 0, expected)
+    print("PASS: full room rejects JOIN and terminal escapes network names")
+
+
+def test_log_backpressure(server):
+    fcntl.fcntl(server.stdout, fcntl.F_SETPIPE_SZ, 4096)
+    with ExitStack() as stack:
+        healthy = login_peer(stack, b"healthy")
+        for _ in range(100):
+            with socket.create_connection(ADDRESS, timeout=2) as bad:
+                bad.sendall(HEADER.pack(2, 0xFFFF, 1, 0))
+                assert bad.recv(1) == b""
+        healthy.sendall(frame(2, 2))
+        assert recv_frame(healthy) == (3, 2, 0, b"\x00\x00")
+        server.terminate()
+        assert server.wait(timeout=2) == 0
+        assert healthy.recv(1) == b""
+    print("PASS: full log pipe leaves server responsive and SIGTERM closes active sessions")
+
+
+def cpu_ticks(pid):
+    with open(f"/proc/{pid}/stat") as stat:
+        fields = stat.read().rsplit(")", 1)[1].split()
+    return int(fields[11]) + int(fields[12])
+
+
+def test_descriptor_exhaustion():
+    with ExitStack() as stack:
+        inherited = [
+            stack.enter_context(open(os.devnull, "rb")).fileno() for _ in range(16)
+        ]
+        server = stack.enter_context(subprocess.Popen(
+            ["./build/server"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            pass_fds=inherited,
+        ))
+        stack.callback(stop, server)
+        wait_output(server, b"Listening on ")
+        healthy = login_peer(stack, b"existing")
+        extra = login_peer(stack, b"disposable")
+        limit = max(map(int, os.listdir(f"/proc/{server.pid}/fd"))) + 1
+        resource.prlimit(server.pid, resource.RLIMIT_NOFILE, (limit, limit))
+
+        pending = stack.enter_context(socket.create_connection(ADDRESS, timeout=2))
+        pending.sendall(frame(1, 1, b"pending"))
+        before = cpu_ticks(server.pid)
+        time.sleep(0.5)
+        assert cpu_ticks(server.pid) - before < os.sysconf("SC_CLK_TCK") / 4
+        healthy.sendall(frame(2, 2))
+        assert recv_frame(healthy) == (3, 2, 0, b"\x00\x00")
+        extra.close()
+        assert recv_frame(pending) == (0xFF, 1, 0, b"")
+        server.send_signal(signal.SIGINT)
+        assert server.wait(timeout=2) == 0
+        assert pending.recv(1) == b""
+    print("PASS: descriptor exhaustion avoids busy-wait, recovers and handles SIGINT")
+
+
 def main():
     with ExitStack() as stack:
         server = launch(stack, "./build/server")
@@ -188,12 +280,15 @@ def main():
         initial_count = len(os.listdir(descriptors))
         test_demo()
         test_wire(server)
+        test_room_capacity_and_display()
         assert server.poll() is None
         deadline = time.monotonic() + 4
         while len(os.listdir(descriptors)) != initial_count:
             assert time.monotonic() < deadline, "Server left client descriptors open"
             time.sleep(0.02)
         print("PASS: server descriptor count returns to baseline")
+        test_log_backpressure(server)
+    test_descriptor_exhaustion()
 
 
 if __name__ == "__main__":

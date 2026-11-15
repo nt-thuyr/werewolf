@@ -8,7 +8,7 @@ Thiết kế tham chiếu ở [ver2](https://docs.google.com/document/d/1o8jz59_
 | --- | --- | --- |
 | SERVER-01 · TCP và đăng nhập | Đã nghiệm thu dồn kênh, đóng/mở khung, định danh theo phiên, cô lập lỗi và dọn kết nối. Server ghi log khi độ dài vượt giới hạn hoặc khung dở hết hạn. | Hoàn tất. |
 | COMMON-01 · Codec dùng chung | Có `include/protocol.h`, `src/common/protocol.c` và các gói mẫu bên dưới. | Đối chiếu gói mẫu với Người 3 và bổ sung mã thông điệp khi tích hợp các task tiếp theo. |
-| SERVER-02 · Xem, tạo và vào phòng | Quản lý ID và sức chứa. Tạo/vào phòng trả phản hồi rồi đẩy danh sách thành viên. Có test JOIN sai ID. | Ca nghiệm thu phòng đầy. |
+| SERVER-02 · Xem, tạo và vào phòng | Quản lý ID và sức chứa. Tạo/vào phòng trả phản hồi rồi đẩy danh sách thành viên. Có test JOIN sai ID và JOIN khi phòng đầy. | Hoàn tất các luồng hiện tại. |
 | SERVER-03 · Quản lý thành viên và Chủ phòng | Khi mất kết nối, server gỡ thành viên, chuyển Chủ phòng cho người vào sớm nhất còn kết nối và xóa phòng rỗng. | Mời, loại và rời phòng chủ động. |
 | SERVER-04 · Heartbeat và thời hạn | Có đồng hồ monotonic dùng cho timeout khung dở của SERVER-01. | PING/PONG, timeout mất kết nối và lịch chốt pha. |
 | SERVER-05 · Nối phòng chờ với game | | Ghép lệnh bắt đầu, luồng sự kiện ván và đường xử lý người rời với mô-đun game. |
@@ -16,7 +16,8 @@ Thiết kế tham chiếu ở [ver2](https://docs.google.com/document/d/1o8jz59_
 ## Luồng xử lý trên server
 
 - `src/server/main.c` mở socket lắng nghe IPv4. Mặc định là `127.0.0.1:5555`, giới hạn 64 kết nối đồng thời.
-- `src/server/session.c` dùng một vòng lặp `poll()` với socket nonblocking. Mỗi phiên giữ số byte đã đọc, vị trí gửi và hạn khung dở riêng. Server chỉ xử lý yêu cầu sau khi đọc đủ header và body. Phản hồi được gửi tiếp từ vị trí đã dừng nếu lần `send()` trước chỉ gửi được một phần.
+- `src/server/session.c` dồn kênh với các socket nonblocking. `ppoll()` cho phép mở chặn SIGINT/SIGTERM ngay khi bắt đầu chờ. Hai tín hiệu này yêu cầu vòng lặp đóng kết nối rồi thoát. Mỗi phiên giữ số byte đã đọc, vị trí gửi và hạn khung dở riêng. Server chỉ xử lý yêu cầu sau khi đọc đủ header và body, rồi tiếp tục từ vị trí đã gửi nếu `send()` trả về số byte ngắn hơn yêu cầu.
+- Khi `accept()` báo cạn tài nguyên, server đợi 250 ms trước lần nhận mới và tiếp tục phục vụ các phiên hiện có. Log khung lỗi ghi theo khả năng của đích nhận. Với pipe hoặc socket đang đầy, log có thể bị bỏ để vòng lặp vẫn xử lý được kết nối.
 - `src/server/lobby.c` xử lý nghiệp vụ phòng và tạo thông báo `ROOM_UPDATE`. Vòng lặp I/O đánh dấu phiên lỗi rồi dọn socket và cập nhật phòng sau khi duyệt các descriptor sẵn sàng.
 
 Cơ sở kỹ thuật trong slide gồm Lec03, slide 13–15 về byte order, Lec04 TCP, slide 14–18 và 28–37 về I/O và framing, Lec06, slide 22–25 về `poll()`, và Lec07, slide 5–9 về nonblocking I/O.
@@ -81,5 +82,7 @@ python3 -B tests/lobby.py
 ```
 
 Bộ test tự mở server và hai client thật để kiểm tra đăng nhập đồng thời, luồng phòng chờ, cập nhật Chủ phòng khi EOF và dùng lại tên. Các socket thử giao thức kiểm tra khung gửi từng byte, 100 khung gửi liền, ghép phản hồi theo ID, tên trùng, header và body sai, ngưỡng năm khung lỗi, timeout header/body dở và reset kết nối. Sau khi các client thoát, số descriptor của server phải trở về mức ban đầu.
+
+Các ca hồi quy kiểm tra pipe log đầy, cạn và khôi phục descriptor, dừng server bằng SIGINT/SIGTERM, từ chối JOIN phòng đầy và hiện tên chứa ký tự điều khiển dưới dạng escape. Tên trên giao thức vẫn được truyền theo byte gốc.
 
 Nguồn kiểm thử nằm trong [tests/lobby.py](../tests/lobby.py). Cách demo bằng tay có trong [README](../README.md).
