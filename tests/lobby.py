@@ -315,6 +315,42 @@ def test_room_administration():
     print("PASS: invite, kick, leave, authorization and host transfer")
 
 
+def test_simultaneous_disconnects(server):
+    with ExitStack() as stack:
+        host = login_peer(stack, b"host")
+        next_member = login_peer(stack, b"next")
+        survivor = login_peer(stack, b"survivor")
+        host.sendall(frame(4, 2, b"\x04room\x05"))
+        assert recv_frame(host) == (0xFF, 2, 0, b"")
+        room_id, _ = expect_room_members(host, [b"host"])
+        room_bytes = struct.pack("!I", room_id)
+
+        next_member.sendall(frame(5, 2, room_bytes))
+        assert recv_frame(next_member) == (0xFF, 2, 0, b"")
+        for peer in (host, next_member):
+            expect_room_members(peer, [b"host", b"next"])
+        survivor.sendall(frame(5, 2, room_bytes))
+        assert recv_frame(survivor) == (0xFF, 2, 0, b"")
+        for peer in (host, next_member, survivor):
+            _, players = expect_room_members(peer, [b"host", b"next", b"survivor"])
+
+        server.send_signal(signal.SIGSTOP)
+        try:
+            _, status = os.waitpid(server.pid, os.WUNTRACED)
+            assert os.WIFSTOPPED(status)
+            host.close()
+            next_member.close()
+        finally:
+            server.send_signal(signal.SIGCONT)
+
+        assert expect_room_members(survivor, [b"survivor"]) == (
+            room_id, {b"survivor": players[b"survivor"]}
+        )
+        survivor.sendall(frame(6, 3))
+        assert recv_frame(survivor) == (0xFF, 3, 0, b"")
+    print("PASS: simultaneous disconnects publish one update with a live host")
+
+
 def test_room_capacity_and_display():
     with ExitStack() as stack:
         host = login_peer(stack, b"host\n\x1b")
@@ -408,6 +444,7 @@ def main():
         test_wire(server)
         test_room_capacity_and_display()
         test_room_administration()
+        test_simultaneous_disconnects(server)
         assert server.poll() is None
         deadline = time.monotonic() + 4
         while len(os.listdir(descriptors)) != initial_count:

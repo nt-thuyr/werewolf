@@ -12,6 +12,10 @@ static void broadcast_room(const struct room *room)
     size_t length = 9;
     for (size_t i = 0; i < room->count; ++i) {
         const struct session *member = room->members[i];
+        // Lần gỡ phiên cuối cùng đang đóng sẽ gửi danh sách đã cập nhật.
+        if (member->closing) {
+            return;
+        }
         protocol_put_u32(body + length, member->id);
         length += 4;
         length += protocol_put_name(body + length, member->username);
