@@ -1,10 +1,25 @@
-# Task 1 · Phòng chờ qua TCP
+# Tiến độ Người 1 · Server mạng, phiên và phòng chờ
 
-## Phạm vi đã triển khai
+Thiết kế tham chiếu ở [ver2](https://docs.google.com/document/d/1o8jz59_vBk5IG-NB3HvIKDmAgUrok2Aztk2Ux5sSsJY/edit?tab=t.s0u7ebxdy021), mục 4–5 về giao thức và mục 8 về xử lý lỗi. Phân công và tiêu chí từng task nằm trong [PLAN.md](PLAN.md).
 
-- Client giữ kết nối sau khi đăng nhập và hỗ trợ `list`, `create <tên_phòng> <sức_chứa>` và `join <room_id>`. Client dùng `poll()` để nhận cập nhật ngay cả khi đang chờ nhập lệnh.
-- Server quản lý phòng trong bộ nhớ. Người tạo phòng là Chủ phòng và là thành viên đầu tiên. Khi có người tham gia, server gửi cùng một danh sách thành viên cho cả phòng. Khi kết nối đóng, server gỡ thành viên, chuyển quyền cho người vào sớm nhất còn kết nối nếu Chủ phòng rời, và xóa phòng khi rỗng.
-- Server dùng TCP nonblocking với `poll()`, giữ dữ liệu đọc dở và hàng đợi gửi có giới hạn cho từng kết nối. Địa chỉ mặc định là `127.0.0.1:5555`, tối đa 64 kết nối đồng thời.
+## Tiến độ
+
+| Task | Kết quả hiện tại | Phần còn lại |
+| --- | --- | --- |
+| SERVER-01 · TCP và đăng nhập | Đã nghiệm thu dồn kênh, đóng/mở khung, định danh theo phiên, cô lập lỗi và dọn kết nối. Server ghi log khi độ dài vượt giới hạn hoặc khung dở hết hạn. | Hoàn tất. |
+| COMMON-01 · Codec dùng chung | Có `include/protocol.h`, `src/common/protocol.c` và các gói mẫu bên dưới. | Đối chiếu gói mẫu với Người 3 và bổ sung mã thông điệp khi tích hợp các task tiếp theo. |
+| SERVER-02 · Xem, tạo và vào phòng | Quản lý ID và sức chứa. Tạo/vào phòng trả phản hồi rồi đẩy danh sách thành viên. Có test JOIN sai ID. | Ca nghiệm thu phòng đầy. |
+| SERVER-03 · Quản lý thành viên và Chủ phòng | Khi mất kết nối, server gỡ thành viên, chuyển Chủ phòng cho người vào sớm nhất còn kết nối và xóa phòng rỗng. | Mời, loại và rời phòng chủ động. |
+| SERVER-04 · Heartbeat và thời hạn | Có đồng hồ monotonic dùng cho timeout khung dở của SERVER-01. | PING/PONG, timeout mất kết nối và lịch chốt pha. |
+| SERVER-05 · Nối phòng chờ với game | | Ghép lệnh bắt đầu, luồng sự kiện ván và đường xử lý người rời với mô-đun game. |
+
+## Luồng xử lý trên server
+
+- `src/server/main.c` mở socket lắng nghe IPv4. Mặc định là `127.0.0.1:5555`, giới hạn 64 kết nối đồng thời.
+- `src/server/session.c` dùng một vòng lặp `poll()` với socket nonblocking. Mỗi phiên giữ số byte đã đọc, vị trí gửi và hạn khung dở riêng. Server chỉ xử lý yêu cầu sau khi đọc đủ header và body. Phản hồi được gửi tiếp từ vị trí đã dừng nếu lần `send()` trước chỉ gửi được một phần.
+- `src/server/lobby.c` xử lý nghiệp vụ phòng và tạo thông báo `ROOM_UPDATE`. Vòng lặp I/O đánh dấu phiên lỗi rồi dọn socket và cập nhật phòng sau khi duyệt các descriptor sẵn sàng.
+
+Cơ sở kỹ thuật trong slide gồm Lec03, slide 13–15 về byte order, Lec04 TCP, slide 14–18 và 28–37 về I/O và framing, Lec06, slide 22–25 về `poll()`, và Lec07, slide 5–9 về nonblocking I/O.
 
 ## Đặc tả giao thức
 
@@ -14,7 +29,7 @@ Header 8 byte, theo thứ tự `msg_type:u8` (offset 0), `length:u16` (1), `requ
 
 Mọi yêu cầu từ client, kể cả `LOGIN`, phải có `request_id` khác `0` và không trùng ID của yêu cầu đang chờ trên cùng socket. Phản hồi giữ nguyên `request_id` của yêu cầu gốc. `ROOM_UPDATE` là thông báo đẩy có `request_id = 0` và `status_code = 0`.
 
-`LOGIN` dùng tên thô làm body của request và body rỗng trong phản hồi. Client gửi `request_id = 1` cho `LOGIN`. Sau khi đăng nhập thành công, server cấp ID phiên. Client tìm ID của mình trong `ROOM_UPDATE` bằng username duy nhất, so sánh theo byte như `LOGIN`.
+`MSG_LOGIN_REQ (0x01)` gửi tên thô dài 1–32 byte. Phản hồi `MSG_RESPONSE` có body rỗng. Client hiện dùng `request_id = 1` cho LOGIN. Sau khi đăng nhập thành công, server cấp ID phiên. Client tìm ID của mình trong `ROOM_UPDATE` bằng tên đăng nhập, so sánh theo byte và phân biệt hoa thường.
 
 | Nhóm | Chiều và mã | Body theo thứ tự | Phản hồi và hiệu ứng |
 | --- | --- | --- | --- |
@@ -32,6 +47,7 @@ Mọi yêu cầu từ client, kể cả `LOGIN`, phải có `request_id` khác `
 | `0x02 ERR_UNAUTHORIZED` | Gửi LIST/CREATE/JOIN hợp lệ khi phiên đã ở trong phòng. |
 | `0x09 ERR_ROOM_NOT_FOUND` | JOIN từ sảnh với ID không tồn tại. |
 | `0x05 ERR_ROOM_FULL` | JOIN từ sảnh vào phòng đã đủ chỗ. |
+| `0x06 ERR_USERNAME_EXIST` | Tên LOGIN trùng tên của một phiên còn kết nối. Tên dùng lại được sau khi phiên cũ được dọn. |
 
 Lệnh thất bại không đổi trạng thái phòng và không phát thông báo đẩy. Với yêu cầu có ID `0`, server trả `MSG_RESPONSE (0xFF)` với ID `0` và status `0x08` mà không thực hiện lệnh. Client phân biệt phản hồi lỗi với `ROOM_UPDATE` bằng `msg_type`. Server đóng riêng kết nối nếu `length > 4096` hoặc khung dở quá 10 giây. Sau 5 frame lỗi liên tiếp, gửi phản hồi lỗi cuối rồi đóng. Các mã lỗi nghiệp vụ không tính là frame lỗi.
 
@@ -53,28 +69,17 @@ Phòng 7 có Host 101 (`alice`) và thành viên 102 (`bob`). `ROOM_UPDATE` có 
 00 00 00 66  03 62 6F 62
 ```
 
-## Chạy và kiểm tra
+## Nghiệm thu SERVER-01
 
-Từ gốc repository trên Linux, chạy `make`. Mở ba terminal cho server, Alice và Bob, rồi chạy lần lượt:
+Bản hiện tại đã build và qua bộ kiểm thử tích hợp trên Ubuntu 22.04 WSL với GCC 11.4.
+
+Từ gốc repository trên Linux, dừng server demo nếu đang chạy rồi thực hiện:
 
 ```sh
-./build/server
-./build/client 127.0.0.1 alice
-./build/client 127.0.0.1 bob
+make -B CFLAGS='-std=c11 -Wall -Wextra -Werror'
+python3 -B tests/lobby.py
 ```
 
-1. Alice nhập `create LangSoi 5` rồi để nguyên terminal. Alice thấy mình là thành viên duy nhất và `host_id` trùng với ID của mình.
-2. Bob nhập `list` để lấy ID phòng. Thử `join 9999` nếu ID đó chưa tồn tại. Bob nhận `ERR_ROOM_NOT_FOUND (0x09)` và vẫn kết nối.
-3. Bob nhập `join <room_id>` với ID vừa lấy. Cả hai terminal tự hiển thị cùng `room_id`, `host_id` của Alice và hai thành viên Alice, Bob.
+Bộ test tự mở server và hai client thật để kiểm tra đăng nhập đồng thời, luồng phòng chờ, cập nhật Chủ phòng khi EOF và dùng lại tên. Các socket thử giao thức kiểm tra khung gửi từng byte, 100 khung gửi liền, ghép phản hồi theo ID, tên trùng, header và body sai, ngưỡng năm khung lỗi, timeout header/body dở và reset kết nối. Sau khi các client thoát, số descriptor của server phải trở về mức ban đầu.
 
-Để chạy kiểm thử tự động, dừng server demo rồi chạy `python3 tests/lobby.py` từ gốc repository. Script tự khởi động server và các client.
-
-## Tiến độ bàn giao
-
-| Hạng mục | Trạng thái |
-| --- | --- |
-| Build và kiểm thử Task 1 | Đã qua trên Ubuntu WSL. GCC với `-std=c11 -Wall -Wextra` không phát cảnh báo. Kiểm thử xác nhận luồng Alice–Bob, JOIN sai, ghép phản hồi theo ID, frame TCP bị chia hoặc gửi liền, cô lập lỗi, timeout, chuyển Chủ phòng và dọn descriptor. |
-| SERVER-01, CLIENT-01, CLIENT-02, COMMON-02 | Đã nghiệm thu và đánh dấu trong `PLAN.md`. |
-| COMMON-01 | Codec dùng chung và gói mẫu đã có để bàn giao. |
-| SERVER-02 | Đã triển khai và kiểm thử luồng phòng chờ. Kiểm tra sức chứa đã có trong code, ca phòng đầy được hoãn. |
-| SERVER-03, CLIENT-03, CLIENT-06 | Đã có phần liên quan Task 1. Các lệnh mời, loại, rời phòng chủ động, bắt đầu ván và các kịch bản tích hợp ngoài phòng chờ thuộc các mốc tiếp theo. |
+Nguồn kiểm thử nằm trong [tests/lobby.py](../tests/lobby.py). Cách demo bằng tay có trong [README](../README.md).

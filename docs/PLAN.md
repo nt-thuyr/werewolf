@@ -12,9 +12,9 @@ Dùng mục 4–8 của ver2 làm chuẩn khi triển khai và đối chiếu. C
 
 ## Breakdown task
 
-Các ô chưa đánh dấu còn phần việc hoặc tiêu chí nghiệm thu. Task 1 đã qua luồng hai client thật, JOIN phòng không tồn tại, cập nhật tự động và dọn phiên trên Ubuntu WSL. Chạy lại bằng `make` và `python3 tests/lobby.py`. [Đặc tả và gói mẫu Task 1](TASK-01-LOBBY.md).
+Các ô chưa đánh dấu còn phần việc hoặc tiêu chí nghiệm thu. [Bàn giao Người 1](SERVER-PROGRESS.md) ghi tiến độ server, gói mẫu giao thức và cách chạy kiểm thử.
 
-SERVER-02 đã có kiểm tra sức chứa. Ca phòng đầy được hoãn. COMMON-01 đã có codec và gói mẫu để bàn giao. CLIENT-03, SERVER-03 và CLIENT-06 đã có phần xem/tạo/vào phòng, dọn thành viên khi ngắt kết nối và kiểm thử tích hợp phòng chờ tương ứng.
+CLIENT-03 và CLIENT-06 đã có các lệnh xem, tạo, vào phòng và bộ kiểm thử tích hợp phòng chờ.
 
 ### Người 1 · Server mạng, phiên và phòng chờ
 

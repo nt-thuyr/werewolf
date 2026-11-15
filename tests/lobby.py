@@ -95,8 +95,8 @@ def test_demo():
         print("PASS: Host transfers on disconnect, empty room is removed, username reusable")
 
 
-def frame(kind, request_id, body=b""):
-    return HEADER.pack(kind, len(body), request_id, 0) + body
+def frame(kind, request_id, body=b"", status=0):
+    return HEADER.pack(kind, len(body), request_id, status) + body
 
 
 def recv_exact(sock, size):
@@ -114,12 +114,17 @@ def recv_frame(sock):
     return kind, request_id, status, bytes(recv_exact(sock, size))
 
 
-def test_wire():
+def test_wire(server):
     with socket.create_connection(ADDRESS, timeout=12) as peer:
         peer.sendall(frame(1, 0, b"wire"))
         assert recv_frame(peer) == (0xFF, 0, 8, b"")
+        peer.sendall(frame(1, 9, b"wire", status=1))
+        assert recv_frame(peer) == (0xFF, 9, 8, b"")
         peer.sendall(frame(2, 10))
         assert recv_frame(peer) == (0xFF, 10, 1, b"")
+        for request_id, body in enumerate((b"", b"x" * 33, b"wire\x00"), 30):
+            peer.sendall(frame(1, request_id, body))
+            assert recv_frame(peer) == (0xFF, request_id, 8, b"")
         for byte in frame(1, 11, b"wire"):
             peer.sendall(bytes([byte]))
             time.sleep(0.01)
@@ -128,24 +133,51 @@ def test_wire():
         with socket.create_connection(ADDRESS, timeout=4) as duplicate:
             duplicate.sendall(frame(1, 12, b"wire"))
             assert recv_frame(duplicate) == (0xFF, 12, 6, b"")
-            duplicate.sendall(HEADER.pack(2, 4097, 13, 0))
+            duplicate.sendall(HEADER.pack(2, 0xFFFF, 13, 0))
             assert duplicate.recv(1) == b""
+        wait_output(server, b"frame body length 65535 exceeds 4096 bytes")
 
         peer.sendall(frame(5, 14, b"\x00") + frame(5, 15, struct.pack("!I", 9999))
-                     + frame(2, 16))
+                     + frame(3, 16) + frame(0x99, 17) + frame(2, 18))
         assert recv_frame(peer) == (0xFF, 14, 8, b"")
         assert recv_frame(peer) == (0xFF, 15, 9, b"")
-        assert recv_frame(peer) == (3, 16, 0, b"\x00\x00")
+        assert recv_frame(peer) == (0xFF, 16, 8, b"")
+        assert recv_frame(peer) == (0xFF, 17, 8, b"")
+        assert recv_frame(peer) == (3, 18, 0, b"\x00\x00")
+
+        request_ids = range(100, 200)
+        peer.sendall(b"".join(frame(2, i) for i in request_ids))
+        for i in request_ids:
+            assert recv_frame(peer) == (3, i, 0, b"\x00\x00")
+
+        with socket.create_connection(ADDRESS, timeout=12) as header, \
+                socket.create_connection(ADDRESS, timeout=12) as body:
+            header.sendall(b"\x01")
+            body.sendall(frame(1, 19, b"unfinished")[:-1])
+            peer.sendall(frame(2, 19))
+            assert recv_frame(peer) == (3, 19, 0, b"\x00\x00")
+            assert header.recv(1) == b""
+            assert body.recv(1) == b""
+        wait_output(server, b"incomplete frame timed out")
+
+        with socket.create_connection(ADDRESS, timeout=4) as aborted:
+            aborted.sendall(frame(1, 19, b"aborted"))
+            assert recv_frame(aborted) == (0xFF, 19, 0, b"")
+            aborted.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                               struct.pack("ii", 1, 0))
+        peer.sendall(frame(2, 19))
+        assert recv_frame(peer) == (3, 19, 0, b"\x00\x00")
 
         peer.sendall(b"".join(frame(5, i, b"\x00") for i in range(20, 25)))
         for i in range(20, 25):
             assert recv_frame(peer) == (0xFF, i, 8, b"")
         assert peer.recv(1) == b""
 
-    with socket.create_connection(ADDRESS, timeout=12) as stalled:
-        stalled.sendall(b"\x01")
-        assert stalled.recv(1) == b""
-    print("PASS: partial and coalesced frames, request IDs, invalid input isolation and frame timeout")
+    with socket.create_connection(ADDRESS, timeout=4) as replacement:
+        replacement.sendall(frame(1, 1, b"wire"))
+        assert recv_frame(replacement) == (0xFF, 1, 0, b"")
+
+    print("PASS: split and 100 coalesced frames, invalid input, timeout and reset isolation")
 
 
 def main():
@@ -155,7 +187,7 @@ def main():
         descriptors = f"/proc/{server.pid}/fd"
         initial_count = len(os.listdir(descriptors))
         test_demo()
-        test_wire()
+        test_wire(server)
         assert server.poll() is None
         deadline = time.monotonic() + 4
         while len(os.listdir(descriptors)) != initial_count:

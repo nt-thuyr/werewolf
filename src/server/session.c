@@ -151,6 +151,8 @@ static bool read_request(int fd, struct lobby *lobby, struct session *session,
 
     protocol_decode_header(&header, session->input);
     if (header.length > PROTOCOL_MAX_BODY) {
+        fprintf(stderr, "Closing fd %d: frame body length %u exceeds %d bytes\n",
+                fd, (unsigned)header.length, PROTOCOL_MAX_BODY);
         return false;
     }
     if (session->received < (size_t)PROTOCOL_HEADER_SIZE + header.length) {
@@ -271,8 +273,10 @@ int serve_sessions(int listener)
                 continue;
             }
             short events = slot->revents;
-            if ((session->deadline_ms != 0 && now >= session->deadline_ms) ||
-                (events & (POLLERR | POLLNVAL))) {
+            if (session->deadline_ms != 0 && now >= session->deadline_ms) {
+                fprintf(stderr, "Closing fd %d: incomplete frame timed out\n", slot->fd);
+                session->closing = true;
+            } else if (events & (POLLERR | POLLNVAL)) {
                 session->closing = true;
             } else if (session->queued != 0 && (events & POLLOUT)) {
                 session->closing = !write_reply(slot->fd, session);
