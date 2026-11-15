@@ -16,8 +16,7 @@
 #include <wctype.h>
 
 enum {
-    MAX_COMMAND = 128,
-    MAX_FRAME = PROTOCOL_HEADER_SIZE + PROTOCOL_MAX_BODY
+    MAX_COMMAND = 128
 };
 
 struct player {
@@ -36,7 +35,7 @@ struct room_view {
 struct client {
     const char *username;
     struct room_view room;
-    uint8_t input[MAX_FRAME];
+    uint8_t input[PROTOCOL_MAX_FRAME];
     uint8_t output[PROTOCOL_HEADER_SIZE + PROTOCOL_MAX_NAME + 2];
     size_t received;
     size_t queued;

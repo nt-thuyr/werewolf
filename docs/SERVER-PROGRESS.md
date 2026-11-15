@@ -7,7 +7,7 @@ Thiết kế tham chiếu ở [ver2](https://docs.google.com/document/d/1o8jz59_
 | Task | Kết quả hiện tại | Phần còn lại |
 | --- | --- | --- |
 | SERVER-01 · TCP và đăng nhập | Đã nghiệm thu dồn kênh, đóng/mở khung, định danh theo phiên, cô lập lỗi và dọn kết nối. Server ghi log khi độ dài vượt giới hạn hoặc khung dở hết hạn. | Hoàn tất. |
-| COMMON-01 · Codec dùng chung | Có `include/protocol.h`, `src/common/protocol.c` và các gói mẫu bên dưới. | Đối chiếu gói mẫu với Người 3 và bổ sung mã thông điệp khi tích hợp các task tiếp theo. |
+| COMMON-01 · Codec dùng chung | API và mã thông điệp hiện tại nằm trong `include/protocol.h`. Hai chương trình đã được kiểm tra với các gói LOGIN và LIST mẫu. | Bổ sung hằng số tương ứng khi tích hợp thông điệp mới. |
 | SERVER-02 · Xem, tạo và vào phòng | Quản lý ID và sức chứa. Tạo/vào phòng trả phản hồi rồi đẩy danh sách thành viên. Có test JOIN sai ID và JOIN khi phòng đầy. | Hoàn tất các luồng hiện tại. |
 | SERVER-03 · Quản lý thành viên và Chủ phòng | Khi mất kết nối, server gỡ thành viên, chuyển Chủ phòng cho người vào sớm nhất còn kết nối và xóa phòng rỗng. | Mời, loại và rời phòng chủ động. |
 | SERVER-04 · Heartbeat và thời hạn | Có đồng hồ monotonic dùng cho timeout khung dở của SERVER-01. | PING/PONG, timeout mất kết nối và lịch chốt pha. |
@@ -52,7 +52,15 @@ Mọi yêu cầu từ client, kể cả `LOGIN`, phải có `request_id` khác `
 
 Lệnh thất bại không đổi trạng thái phòng và không phát thông báo đẩy. Với yêu cầu có ID `0`, server trả `MSG_RESPONSE (0xFF)` với ID `0` và status `0x08` mà không thực hiện lệnh. Client phân biệt phản hồi lỗi với `ROOM_UPDATE` bằng `msg_type`. Server đóng riêng kết nối nếu `length > 4096` hoặc khung dở quá 10 giây. Sau 5 frame lỗi liên tiếp, gửi phản hồi lỗi cuối rồi đóng. Các mã lỗi nghiệp vụ không tính là frame lỗi.
 
-Các gói mẫu dùng để kiểm tra codec và ghép phản hồi:
+### API dùng chung cho client và server
+
+Hai chương trình cùng include [protocol.h](../include/protocol.h) và dịch với [protocol.c](../src/common/protocol.c). Dùng `PROTOCOL_MAX_FRAME` cho bộ đệm chứa một khung tối đa, gồm 8 byte header và 4096 byte body.
+
+- `protocol_encode_header()` và `protocol_decode_header()` đọc hoặc ghi đúng `PROTOCOL_HEADER_SIZE` byte. Bên nhận gom đủ header rồi mới giải mã và kiểm tra độ dài, loại thông điệp cùng các trường liên quan trước khi xử lý body.
+- `protocol_put_u16()`, `protocol_put_u32()` và hai hàm đọc tương ứng chuyển đổi số nguyên theo thứ tự byte mạng. Bên gọi bảo đảm bộ đệm còn đủ 2 hoặc 4 byte.
+- `protocol_put_name()` ghi trường `Name` đã được kiểm tra độ dài và trả số byte đã ghi. `protocol_get_name()` kiểm tra trường theo độ dài body, thêm NUL vào bộ đệm đích và cập nhật offset khi thành công. LOGIN gửi tên thô theo độ dài header.
+
+### Gói mẫu trên đường truyền
 
 | Frame | Hex |
 | --- | --- |
@@ -69,6 +77,8 @@ Phòng 7 có Host 101 (`alice`) và thành viên 102 (`bob`). `ROOM_UPDATE` có 
 00 00 00 65  05 61 6C 69 63 65
 00 00 00 66  03 62 6F 62
 ```
+
+`test_protocol_samples()` trong [tests/lobby.py](../tests/lobby.py) chuyển tiếp gói thật giữa client và server qua loopback. Ca kiểm thử so từng byte của LOGIN và LIST trên cùng kết nối để phát hiện byte dư sau LOGIN ở cả hai chiều.
 
 ## Nghiệm thu SERVER-01
 

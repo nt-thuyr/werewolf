@@ -4,15 +4,14 @@
 #include "protocol.h"
 
 enum {
-    MAX_SESSIONS = 64,
-    MAX_FRAME = PROTOCOL_HEADER_SIZE + PROTOCOL_MAX_BODY
+    MAX_SESSIONS = 64
 };
 
 struct room;
 
 struct session {
-    uint8_t input[MAX_FRAME];
-    uint8_t output[2 * MAX_FRAME];
+    uint8_t input[PROTOCOL_MAX_FRAME];
+    uint8_t output[2 * PROTOCOL_MAX_FRAME];
     size_t received;
     size_t sent;
     size_t queued;
