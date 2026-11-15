@@ -251,23 +251,58 @@ static bool write_reply(int fd, struct session *session)
     return true;
 }
 
-static bool accept_session(int listener, struct pollfd *slots)
+static void service_session(const struct pollfd *slot, struct lobby *lobby,
+                            struct session *session, int64_t now, int log_fd)
+{
+    if (slot->fd == -1 || session->closing) {
+        return;
+    }
+
+    short events = slot->revents;
+    if (session->deadline_ms != 0 && now >= session->deadline_ms) {
+        char message[80];
+        snprintf(message, sizeof message,
+                 "Closing fd %d: incomplete frame timed out\n", slot->fd);
+        log_frame_error(log_fd, message);
+        session->closing = true;
+    } else if (events & (POLLERR | POLLNVAL)) {
+        session->closing = true;
+    } else if (session->queued != 0 && (events & POLLOUT)) {
+        session->closing = !write_reply(slot->fd, session);
+    } else if (session->queued == 0 && (events & POLLIN)) {
+        if (!read_request(slot->fd, lobby, session, now, log_fd)) {
+            session->closing = true;
+        }
+    } else if (events & POLLHUP) {
+        session->closing = true;
+    }
+}
+
+enum accept_result {
+    ACCEPT_KEEP_LISTENING,
+    ACCEPT_RETRY_LATER
+};
+
+static enum accept_result accept_session(int listener, struct pollfd *slots)
 {
     int client = accept(listener, NULL, NULL);
     if (client == -1) {
-        return errno != EMFILE && errno != ENFILE &&
-               errno != ENOBUFS && errno != ENOMEM;
+        if (errno == EMFILE || errno == ENFILE ||
+            errno == ENOBUFS || errno == ENOMEM) {
+            return ACCEPT_RETRY_LATER;
+        }
+        return ACCEPT_KEEP_LISTENING;
     }
     if (set_nonblocking(client) == 0) {
         for (size_t i = 1; i <= MAX_SESSIONS; ++i) {
             if (slots[i].fd == -1) {
                 slots[i].fd = client;
-                return true;
+                return ACCEPT_KEEP_LISTENING;
             }
         }
     }
     close(client);
-    return true;
+    return ACCEPT_KEEP_LISTENING;
 }
 
 int serve_sessions(int listener, const char *bind_ip)
@@ -286,7 +321,7 @@ int serve_sessions(int listener, const char *bind_ip)
         perror("signal setup");
         return -1;
     }
-    // Mở mô tả riêng để không đổi cờ I/O của stderr được kế thừa.
+    // Mở lại stderr để bật O_NONBLOCK riêng cho đường ghi log.
     int log_fd = open("/proc/self/fd/2", O_WRONLY | O_NONBLOCK | O_APPEND | O_CLOEXEC);
     printf("Listening on %s:%d\n", bind_ip, WEREWOLF_PORT);
     fflush(stdout);
@@ -335,7 +370,7 @@ int serve_sessions(int listener, const char *bind_ip)
             if (errno == EINTR) {
                 continue;
             }
-            perror("poll");
+            perror("ppoll");
             break;
         }
         now = monotonic_ms();
@@ -344,29 +379,7 @@ int serve_sessions(int listener, const char *bind_ip)
             break;
         }
         for (size_t i = 1; i < count; ++i) {
-            struct pollfd *slot = &slots[i];
-            struct session *session = &lobby.sessions[i - 1];
-            if (slot->fd == -1 || session->closing) {
-                continue;
-            }
-            short events = slot->revents;
-            if (session->deadline_ms != 0 && now >= session->deadline_ms) {
-                char message[80];
-                snprintf(message, sizeof message,
-                         "Closing fd %d: incomplete frame timed out\n", slot->fd);
-                log_frame_error(log_fd, message);
-                session->closing = true;
-            } else if (events & (POLLERR | POLLNVAL)) {
-                session->closing = true;
-            } else if (session->queued != 0 && (events & POLLOUT)) {
-                session->closing = !write_reply(slot->fd, session);
-            } else if (session->queued == 0 && (events & POLLIN)) {
-                if (!read_request(slot->fd, &lobby, session, now, log_fd)) {
-                    session->closing = true;
-                }
-            } else if (events & POLLHUP) {
-                session->closing = true;
-            }
+            service_session(&slots[i], &lobby, &lobby.sessions[i - 1], now, log_fd);
         }
         // Dọn phiên lỗi và cập nhật phòng trước khi nhận kết nối mới.
         close_failed_sessions(slots, &lobby);
@@ -374,7 +387,8 @@ int serve_sessions(int listener, const char *bind_ip)
             fputs("Listening socket failed\n", stderr);
             break;
         }
-        if ((slots[0].revents & POLLIN) && !accept_session(listener, slots)) {
+        if ((slots[0].revents & POLLIN) &&
+            accept_session(listener, slots) == ACCEPT_RETRY_LATER) {
             accept_retry_at = now + ACCEPT_RETRY_MS;
         }
     }
