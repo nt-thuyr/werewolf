@@ -1,17 +1,6 @@
-# Tiến độ Người 1 · NND · Server mạng, phiên và phòng chờ
+# Giao thức và triển khai server phòng chờ
 
 Thiết kế tham chiếu ở [ver2](https://docs.google.com/document/d/1o8jz59_vBk5IG-NB3HvIKDmAgUrok2Aztk2Ux5sSsJY/edit?tab=t.s0u7ebxdy021), mục 4–5 về giao thức và mục 8 về xử lý lỗi. Phân công và tiêu chí từng task nằm trong [PLAN.md](PLAN.md).
-
-## Tiến độ
-
-| Task | Kết quả hiện tại | Phần còn lại |
-| --- | --- | --- |
-| SERVER-01 · TCP và đăng nhập | Đã nghiệm thu dồn kênh, đóng/mở khung, định danh theo phiên, cô lập lỗi và dọn kết nối. Server ghi log khi độ dài vượt giới hạn hoặc khung dở hết hạn. | Hoàn tất. |
-| COMMON-01 · Codec dùng chung | API và mã thông điệp hiện tại nằm trong `include/protocol.h`. Hai chương trình đã được kiểm tra với các gói LOGIN và LIST mẫu. | Bổ sung hằng số tương ứng khi tích hợp thông điệp mới. |
-| SERVER-02 · Xem, tạo và vào phòng | Quản lý ID và sức chứa. Tạo/vào phòng trả phản hồi rồi đẩy danh sách thành viên. Có test JOIN sai ID và JOIN khi phòng đầy. | Hoàn tất các luồng hiện tại. |
-| SERVER-03 · Quản lý thành viên và Chủ phòng | Server xử lý mời, loại và rời phòng chủ động. Cùng một đường gỡ thành viên xử lý chuyển Chủ phòng và xóa phòng rỗng khi thành viên rời, bị loại hoặc mất kết nối. | Các lệnh và thông báo trên giao diện client thuộc CLIENT-03. |
-| SERVER-04 · Heartbeat và thời hạn | Có đồng hồ monotonic dùng cho timeout khung dở của SERVER-01. | PING/PONG, timeout mất kết nối và lịch chốt pha. |
-| SERVER-05 · Nối phòng chờ với game | | Ghép lệnh bắt đầu, luồng sự kiện ván và đường xử lý người rời với mô-đun game. |
 
 ## Luồng xử lý trên server
 
@@ -93,9 +82,7 @@ Phòng 7 có Host 101 (`alice`) và thành viên 102 (`bob`). `ROOM_UPDATE` có 
 
 `test_protocol_samples()` trong [tests/lobby.py](../tests/lobby.py) chuyển tiếp gói thật giữa client và server qua loopback. Ca kiểm thử so từng byte của LOGIN và LIST trên cùng kết nối để phát hiện byte dư sau LOGIN ở cả hai chiều.
 
-## Nghiệm thu SERVER-01
-
-Bản hiện tại đã build và qua bộ kiểm thử tích hợp trên Ubuntu 22.04 WSL với GCC 11.4.
+## Chạy kiểm thử
 
 Từ gốc repository trên Linux, dừng server demo nếu đang chạy rồi thực hiện:
 

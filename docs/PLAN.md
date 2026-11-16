@@ -67,7 +67,7 @@ Viết/chạy test cùng từng task; cuối cùng tổng hợp và chạy lại
 
 ## Breakdown task
 
-Các ô chưa đánh dấu còn phần việc hoặc tiêu chí nghiệm thu. [Bàn giao Người 1](SERVER-PROGRESS.md) ghi tiến độ server, gói mẫu giao thức và cách chạy kiểm thử.
+Các ô chưa đánh dấu còn phần việc hoặc tiêu chí nghiệm thu. [Giao thức và triển khai server phòng chờ](PROTOCOL.md) ghi chi tiết giao thức, gói mẫu và cách chạy kiểm thử.
 
 CLIENT-03 và CLIENT-06 đã có các lệnh xem, tạo, vào phòng và bộ kiểm thử tích hợp phòng chờ.
 
