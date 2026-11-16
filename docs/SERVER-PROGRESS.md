@@ -1,4 +1,4 @@
-# Tiến độ Người 1 · Server mạng, phiên và phòng chờ
+# Tiến độ Người 1 · NND · Server mạng, phiên và phòng chờ
 
 Thiết kế tham chiếu ở [ver2](https://docs.google.com/document/d/1o8jz59_vBk5IG-NB3HvIKDmAgUrok2Aztk2Ux5sSsJY/edit?tab=t.s0u7ebxdy021), mục 4–5 về giao thức và mục 8 về xử lý lỗi. Phân công và tiêu chí từng task nằm trong [PLAN.md](PLAN.md).
 
