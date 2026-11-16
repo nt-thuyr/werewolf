@@ -53,6 +53,12 @@ static void prompt(void)
     fflush(stdout);
 }
 
+static void print_commands(void)
+{
+    puts("Commands: list | create <name> <5-12> | join <room_id> | "
+         "invite <username> | kick <player_id> | leave | start | help");
+}
+
 static bool parse_number(const char *text, uint32_t *value)
 {
     if (text == NULL || text[0] < '0' || text[0] > '9') {
@@ -82,7 +88,11 @@ static void queue_command(struct client *client)
 
     char *argument = strtok(NULL, " \t\r");
     uint32_t number;
-    if (strcmp(command, "list") == 0 && argument == NULL) {
+    if (strcmp(command, "help") == 0 && argument == NULL) {
+        print_commands();
+        prompt();
+        return;
+    } else if (strcmp(command, "list") == 0 && argument == NULL) {
         type = MSG_ROOM_LIST_REQ;
     } else if (strcmp(command, "create") == 0 && argument != NULL &&
                strlen(argument) <= PROTOCOL_MAX_NAME &&
@@ -97,8 +107,22 @@ static void queue_command(struct client *client)
         type = MSG_JOIN_ROOM_REQ;
         protocol_put_u32(body, number);
         length = 4;
+    } else if (strcmp(command, "invite") == 0 && argument != NULL &&
+               strlen(argument) <= PROTOCOL_MAX_USERNAME &&
+               strtok(NULL, " \t\r") == NULL) {
+        type = MSG_INVITE_REQ;
+        length = protocol_put_name(body, argument);
+    } else if (strcmp(command, "kick") == 0 && parse_number(argument, &number) &&
+               strtok(NULL, " \t\r") == NULL) {
+        type = MSG_KICK_REQ;
+        protocol_put_u32(body, number);
+        length = 4;
+    } else if (strcmp(command, "leave") == 0 && argument == NULL) {
+        type = MSG_LEAVE_ROOM_REQ;
+    } else if (strcmp(command, "start") == 0 && argument == NULL) {
+        type = MSG_START_GAME_REQ;
     } else {
-        puts("Commands: list | create <name> <5-12> | join <room_id>");
+        print_commands();
         prompt();
         return;
     }
@@ -216,6 +240,7 @@ static bool update_room(struct client *client, const uint8_t *body, size_t lengt
         print_name(player->name);
         putchar('\n');
     }
+    puts(room.self_id == room.host_id ? "You are the host" : "You are a member");
     return true;
 }
 
@@ -225,9 +250,14 @@ static void print_request_error(uint8_t status)
     switch (status) {
     case ERR_UNAUTHENTICATED: name = "ERR_UNAUTHENTICATED"; break;
     case ERR_UNAUTHORIZED: name = "ERR_UNAUTHORIZED"; break;
+    case ERR_WRONG_PHASE: name = "ERR_WRONG_PHASE"; break;
+    case ERR_INVALID_TARGET: name = "ERR_INVALID_TARGET"; break;
     case ERR_ROOM_FULL: name = "ERR_ROOM_FULL"; break;
     case ERR_INVALID_PAYLOAD: name = "ERR_INVALID_PAYLOAD"; break;
     case ERR_ROOM_NOT_FOUND: name = "ERR_ROOM_NOT_FOUND"; break;
+    case ERR_GAME_RUNNING: name = "ERR_GAME_RUNNING"; break;
+    case ERR_NOT_ENOUGH_PLAYERS: name = "ERR_NOT_ENOUGH_PLAYERS"; break;
+    case ERR_RATE_LIMITED: name = "ERR_RATE_LIMITED"; break;
     case ERR_INTERNAL: name = "ERR_INTERNAL"; break;
     }
     printf("%s (0x%02X)\n", name, (unsigned)status);
@@ -240,6 +270,29 @@ static bool handle_message(struct client *client, const struct message_header *h
     if (header->type == MSG_ROOM_UPDATE) {
         return header->request_id == 0 && header->status == ERR_SUCCESS &&
                update_room(client, body, header->length);
+    }
+    if (header->type == MSG_INVITE_NOTIF) {
+        char host[PROTOCOL_MAX_NAME + 1];
+        size_t offset = 4;
+        if (header->request_id != 0 || header->status != ERR_SUCCESS ||
+            header->length < 5 || protocol_get_u32(body) == 0 ||
+            !protocol_get_name(body, header->length, &offset, host) ||
+            offset != header->length) {
+            return false;
+        }
+        fputs("\nInvitation from ", stdout);
+        print_name(host);
+        printf(": join %" PRIu32 "\n", protocol_get_u32(body));
+        return true;
+    }
+    if (header->type == MSG_KICK_NOTIF) {
+        if (header->request_id != 0 || header->status != ERR_SUCCESS ||
+            header->length != 1 || body[0] != KICK_REASON_HOST) {
+            return false;
+        }
+        client->room = (struct room_view){0};
+        puts("\nKicked by host; returned to lobby");
+        return true;
     }
     if (client->pending_type == 0 || header->request_id != client->last_request_id) {
         return false;
@@ -255,7 +308,20 @@ static bool handle_message(struct client *client, const struct message_header *h
         } else if (client->pending_type == MSG_ROOM_LIST_REQ) {
             return false;
         } else {
-            puts(client->pending_type == MSG_CREATE_ROOM_REQ ? "Room created" : "Room joined");
+            switch (client->pending_type) {
+            case MSG_CREATE_ROOM_REQ: puts("Room created"); break;
+            case MSG_JOIN_ROOM_REQ: puts("Room joined"); break;
+            case MSG_INVITE_REQ: puts("Invitation sent"); break;
+            case MSG_KICK_REQ: puts("Player kicked"); break;
+            case MSG_LEAVE_ROOM_REQ:
+                client->room = (struct room_view){0};
+                puts("Left room; returned to lobby");
+                break;
+            case MSG_START_GAME_REQ:
+                puts("Start accepted; waiting for role and phase from server");
+                break;
+            default: return false;
+            }
         }
     } else {
         return false;
@@ -361,7 +427,7 @@ int run_lobby(int fd, const char *username)
     }
 
     struct client client = {.username = username, .last_request_id = 1};
-    puts("Commands: list | create <name> <5-12> | join <room_id>");
+    print_commands();
     prompt();
     for (;;) {
         struct pollfd sources[] = {
