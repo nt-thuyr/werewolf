@@ -26,12 +26,24 @@ static uint64_t next_random(uint64_t *state)
     return value * UINT64_C(2685821657736338717);
 }
 
+/* Lấy số trong [0, upper_bound) mà không tạo lệch do phép chia dư. */
+static uint64_t random_below(uint64_t *state, uint64_t upper_bound)
+{
+    uint64_t threshold = (UINT64_C(0) - upper_bound) % upper_bound;
+    uint64_t value;
+    do
+    {
+        value = next_random(state);
+    } while (value < threshold);
+    return value % upper_bound;
+}
+
 static void shuffle_roles(enum game_role *roles, size_t count,
                           uint64_t *random_state)
 {
     for (size_t i = count; i > 1; --i)
     {
-        size_t other = (size_t)(next_random(random_state) % i);
+        size_t other = (size_t)random_below(random_state, i);
         enum game_role temporary = roles[i - 1];
         roles[i - 1] = roles[other];
         roles[other] = temporary;

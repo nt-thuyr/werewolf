@@ -103,6 +103,16 @@ static bool check_initial_events(const struct game *game,
                           wolf_event->data.wolf_team_info.wolf_count,
                           wolf_id));
     }
+    for (size_t i = 0; i < game->player_count; ++i)
+    {
+        bool is_wolf = game->players[i].role == GAME_ROLE_WEREWOLF;
+        CHECK(contains_id(wolf_event->recipient_ids,
+                          wolf_event->recipient_count,
+                          game->players[i].id) == is_wolf);
+        CHECK(contains_id(wolf_event->data.wolf_team_info.wolf_ids,
+                          wolf_event->data.wolf_team_info.wolf_count,
+                          game->players[i].id) == is_wolf);
+    }
 
     const struct game_event *phase_event =
         &events->events[game->player_count + 1];
@@ -162,12 +172,14 @@ static bool test_valid_initialization(void)
     /* Chứng minh game đã sao chép ID, không giữ mảng của bên gọi. */
     ids[0] = 9999;
     CHECK(game.players[0].id == 101);
+    CHECK(events.events[0].recipient_ids[0] == 101);
+    CHECK(events.events[game.player_count + 1].recipient_ids[0] == 101);
     return true;
 }
 
 static bool test_role_composition_boundaries(void)
 {
-    const size_t counts[] = {5, 6, 7, 9, 10, 12};
+    const size_t counts[] = {5, 6, 7, 8, 9, 10, 11, 12};
     for (size_t case_index = 0;
          case_index < sizeof counts / sizeof counts[0]; ++case_index)
     {
@@ -187,6 +199,63 @@ static bool test_role_composition_boundaries(void)
         CHECK(game_init(&game, &input, &events) == GAME_RESULT_OK);
         CHECK(check_role_counts(&game));
         CHECK(check_initial_events(&game, &events));
+    }
+    return true;
+}
+
+static bool test_reinitialize_clears_old_game(void)
+{
+    uint32_t old_ids[] = {101, 102, 103, 104, 105, 106,
+                          107, 108, 109, 110, 111, 112};
+    uint32_t new_ids[] = {201, 202, 203, 204, 205};
+    struct game game = {0};
+    struct game_event_batch events = {0};
+    struct game_start_input input = {
+        .player_ids = old_ids,
+        .player_count = 12,
+        .now_ms = 1000,
+        .random_seed = 11
+    };
+
+    CHECK(game_init(&game, &input, &events) == GAME_RESULT_OK);
+    game.players[0].alive = false;
+    game.players[1].night_action_submitted = true;
+    game.players[1].night_target_id = old_ids[2];
+    game.players[2].vote_submitted = true;
+    game.players[2].vote_target_id = old_ids[3];
+    game.players[3].last_guarded_id = old_ids[4];
+
+    input.player_ids = new_ids;
+    input.player_count = 5;
+    input.now_ms = 9000;
+    input.random_seed = 22;
+    CHECK(game_init(&game, &input, &events) == GAME_RESULT_OK);
+    CHECK(game.player_count == 5);
+    CHECK(game.phase == GAME_PHASE_NIGHT);
+    CHECK(game.phase_started_ms == 9000);
+    CHECK(game.deadline_ms == 39000);
+    CHECK(check_role_counts(&game));
+    CHECK(check_initial_events(&game, &events));
+
+    for (size_t i = 0; i < game.player_count; ++i)
+    {
+        CHECK(game.players[i].id == new_ids[i]);
+        CHECK(game.players[i].alive);
+        CHECK(game.players[i].connected);
+        CHECK(!game.players[i].night_action_submitted);
+        CHECK(game.players[i].night_target_id == 0);
+        CHECK(!game.players[i].vote_submitted);
+        CHECK(game.players[i].vote_target_id == 0);
+        CHECK(game.players[i].last_guarded_id == 0);
+    }
+    for (size_t i = game.player_count; i < PROTOCOL_MAX_PLAYERS; ++i)
+    {
+        const struct game_player empty = {0};
+        CHECK(memcmp(&game.players[i], &empty, sizeof empty) == 0);
+    }
+    for (size_t i = 0; i < sizeof old_ids / sizeof old_ids[0]; ++i)
+    {
+        CHECK(game_find_player(&game, old_ids[i]) == NULL);
     }
     return true;
 }
@@ -323,6 +392,7 @@ int main(void)
 {
     if (!test_valid_initialization() ||
         !test_role_composition_boundaries() ||
+        !test_reinitialize_clears_old_game() ||
         !test_invalid_inputs_are_atomic() ||
         !test_repeatable_seed_and_independent_games() ||
         !test_helpers_and_unimplemented_handlers())
