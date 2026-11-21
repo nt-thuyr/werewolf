@@ -95,8 +95,6 @@ struct game_player
 struct game
 {
     bool initialized;
-    /* Đêm đã chốt và có người chết, đang chờ SERVER-10 xét thắng. */
-    bool awaiting_win_check;
     enum game_phase phase;
     enum game_faction winner;
     uint8_t player_count;
@@ -224,7 +222,7 @@ struct game_event
     } data;
 };
 
-/* Mỗi hàm xóa count trước khi thêm sự kiện. Bên gọi sở hữu batch */
+/* Các hàm xử lý xóa count trước khi thêm sự kiện. Bên gọi sở hữu batch. */
 struct game_event_batch
 {
     size_t count;
@@ -262,6 +260,13 @@ enum game_result game_handle_timeout(struct game *game, uint64_t now_ms,
 enum game_result game_handle_player_left(struct game *game,
                                          uint32_t player_id, uint64_t now_ms,
                                          struct game_event_batch *events);
+
+/*
+ * Xét thắng từ trạng thái sống/chết hiện tại. Hàm nối GAME_OVER vào batch đang
+ * có để giữ thứ tự sau NIGHT_RESULT hoặc DAY_RESULT; không xóa events->count.
+ */
+enum game_result game_check_winner(struct game *game,
+                                   struct game_event_batch *events);
 
 /* Hàm chỉ đọc cho kiểm thử. */
 const struct game_player *game_find_player(const struct game *game,

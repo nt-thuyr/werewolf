@@ -309,7 +309,7 @@ static bool test_timeout_tie_and_no_actions(void)
     return true;
 }
 
-static bool test_majority_kill_waits_for_server_10(void)
+static bool test_majority_kill_continues_to_day(void)
 {
     struct game game = {0};
     struct game_event_batch events = {0};
@@ -339,13 +339,13 @@ static bool test_majority_kill_waits_for_server_10(void)
     CHECK(result != NULL);
     CHECK(result->data.night_result.killed_player_id == target->id);
     CHECK(!target->alive);
-    CHECK(game.awaiting_win_check);
-    CHECK(game.phase == GAME_PHASE_NIGHT);
-    CHECK(game_next_deadline_ms(&game) == UINT64_MAX);
-    CHECK(find_event(&events, GAME_EVENT_PHASE_CHANGE, 0) == NULL);
+    CHECK(!game_is_over(&game));
+    CHECK(game.phase == GAME_PHASE_DAY_DISCUSS);
+    CHECK(find_event(&events, GAME_EVENT_GAME_OVER, 0) == NULL);
+    CHECK(find_event(&events, GAME_EVENT_PHASE_CHANGE, 0) != NULL);
 
     struct game saved = game;
-    CHECK(game_handle_timeout(&game, game.deadline_ms, &events) ==
+    CHECK(game_handle_timeout(&game, game.phase_started_ms, &events) ==
           GAME_RESULT_OK);
     CHECK(events.count == 0);
     CHECK(memcmp(&game, &saved, sizeof saved) == 0);
@@ -390,7 +390,7 @@ int main(void)
     if (!test_valid_actions_and_private_events() ||
         !test_invalid_actions_preserve_choices() ||
         !test_timeout_tie_and_no_actions() ||
-        !test_majority_kill_waits_for_server_10() ||
+        !test_majority_kill_continues_to_day() ||
         !test_late_command_and_independent_games())
     {
         return 1;

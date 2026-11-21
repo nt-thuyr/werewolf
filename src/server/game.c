@@ -266,15 +266,81 @@ static bool append_day_discuss_event(const struct game *game,
     return true;
 }
 
-/* Phân xử một đêm đúng một lần. SERVER-10 sẽ xử lý nhánh có người chết. */
-static enum game_result settle_night(struct game *game, uint64_t now_ms,
-                                     struct game_event_batch *events)
+static enum game_faction detect_winner(const struct game *game)
 {
-    if (game->awaiting_win_check)
+    size_t alive_wolves = 0;
+    size_t alive_others = 0;
+    for (size_t i = 0; i < game->player_count; ++i)
+    {
+        if (!game->players[i].alive)
+        {
+            continue;
+        }
+        if (game->players[i].role == GAME_ROLE_WEREWOLF)
+        {
+            ++alive_wolves;
+        }
+        else
+        {
+            ++alive_others;
+        }
+    }
+
+    if (alive_wolves == 0)
+    {
+        return GAME_FACTION_VILLAGE;
+    }
+    if (alive_wolves >= alive_others)
+    {
+        return GAME_FACTION_WEREWOLF;
+    }
+    return GAME_FACTION_NONE;
+}
+
+enum game_result game_check_winner(struct game *game,
+                                   struct game_event_batch *events)
+{
+    if (game == NULL || events == NULL || !game->initialized ||
+        events->count > GAME_MAX_EVENTS)
+    {
+        return GAME_RESULT_INTERNAL;
+    }
+    if (game_is_over(game))
     {
         return GAME_RESULT_OK;
     }
 
+    enum game_faction winner = detect_winner(game);
+    if (winner == GAME_FACTION_NONE)
+    {
+        return GAME_RESULT_OK;
+    }
+
+    struct game next_game = *game;
+    struct game_event_batch next_events = *events;
+    struct game_event *event;
+    if (!append_event(&next_events, GAME_EVENT_GAME_OVER, &event))
+    {
+        return GAME_RESULT_INTERNAL;
+    }
+
+    next_game.phase = GAME_PHASE_OVER;
+    next_game.winner = winner;
+    next_game.deadline_ms = UINT64_MAX;
+    add_connected_recipients(&next_game, event);
+    event->data.game_over.winner = winner;
+    /* Ver2 không quy định nội dung summary nên không tự thêm câu chữ. */
+    event->data.game_over.summary_length = 0;
+
+    *game = next_game;
+    *events = next_events;
+    return GAME_RESULT_OK;
+}
+
+/* Phân xử một đêm đúng một lần rồi xét thắng. */
+static enum game_result settle_night(struct game *game, uint64_t now_ms,
+                                     struct game_event_batch *events)
+{
     uint8_t votes[PROTOCOL_MAX_PLAYERS] = {0};
     for (size_t i = 0; i < game->player_count; ++i)
     {
@@ -332,13 +398,6 @@ static enum game_result settle_night(struct game *game, uint64_t now_ms,
         }
     }
 
-    if (killed_id == 0 &&
-        now_ms > UINT64_MAX -
-                     (uint64_t)GAME_DAY_DISCUSS_DURATION_SEC * UINT64_C(1000))
-    {
-        return GAME_RESULT_INTERNAL;
-    }
-
     struct game next_game = *game;
     struct game_event_batch next_events = *events;
     if (killed_id != 0)
@@ -367,12 +426,20 @@ static enum game_result settle_night(struct game *game, uint64_t now_ms,
         return GAME_RESULT_INTERNAL;
     }
 
-    if (killed_id != 0)
+    enum game_result winner_result =
+        game_check_winner(&next_game, &next_events);
+    if (winner_result != GAME_RESULT_OK)
     {
-        next_game.awaiting_win_check = true;
+        return winner_result;
     }
-    else
+    if (!game_is_over(&next_game))
     {
+        if (now_ms > UINT64_MAX -
+                         (uint64_t)GAME_DAY_DISCUSS_DURATION_SEC *
+                             UINT64_C(1000))
+        {
+            return GAME_RESULT_INTERNAL;
+        }
         next_game.phase = GAME_PHASE_DAY_DISCUSS;
         next_game.phase_started_ms = now_ms;
         next_game.deadline_ms =
@@ -410,7 +477,7 @@ const struct game_player *game_find_player(const struct game *game,
 uint64_t game_next_deadline_ms(const struct game *game)
 {
     if (game == NULL || !game->initialized || game_is_over(game) ||
-        game->phase == GAME_PHASE_NONE || game->awaiting_win_check)
+        game->phase == GAME_PHASE_NONE)
     {
         return UINT64_MAX;
     }
@@ -529,8 +596,7 @@ enum game_result game_handle_command(struct game *game, uint32_t player_id,
     {
         return GAME_RESULT_INVALID_PAYLOAD;
     }
-    if (game_is_over(game) || game->phase != GAME_PHASE_NIGHT ||
-        game->awaiting_win_check)
+    if (game_is_over(game) || game->phase != GAME_PHASE_NIGHT)
     {
         return GAME_RESULT_WRONG_PHASE;
     }
@@ -640,7 +706,7 @@ enum game_result game_handle_timeout(struct game *game, uint64_t now_ms,
     {
         return GAME_RESULT_INTERNAL;
     }
-    if (game_is_over(game) || game->awaiting_win_check)
+    if (game_is_over(game))
     {
         return GAME_RESULT_OK;
     }
