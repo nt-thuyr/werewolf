@@ -4,8 +4,9 @@ CFLAGS ?= -std=c11 -Wall -Wextra
 BUILD_DIR := build
 COMMON_SOURCE := src/common/protocol.c
 COMMON_HEADERS := include/net_config.h include/protocol.h
+GAME_TEST := $(BUILD_DIR)/test_game
 
-.PHONY: all clean
+.PHONY: all clean test-game
 
 all: $(BUILD_DIR)/server $(BUILD_DIR)/client
 
@@ -15,8 +16,14 @@ $(BUILD_DIR)/server: src/server/main.c src/server/session.c include/server/sessi
 $(BUILD_DIR)/client: src/client/main.c src/client/lobby.c include/client/lobby.h $(COMMON_SOURCE) $(COMMON_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
+$(GAME_TEST): tests/game.c src/server/game.c include/server/game.h include/protocol.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+test-game: $(GAME_TEST)
+	./$(GAME_TEST)
+
 $(BUILD_DIR):
 	mkdir -p $@
 
 clean:
-	$(RM) $(BUILD_DIR)/server $(BUILD_DIR)/client
+	$(RM) $(BUILD_DIR)/server $(BUILD_DIR)/client $(GAME_TEST)

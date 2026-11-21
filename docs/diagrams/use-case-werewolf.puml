@@ -1,0 +1,139 @@
+@startuml
+' Model status: to-be/design
+' Evidence scope: user-provided problem statement in chat
+' Visual reference: user-provided Astah-style use-case diagram
+
+title Hệ thống chơi Ma Sói qua mạng — to-be/design
+top to bottom direction
+
+<style>
+root {
+  FontName Arial
+  FontSize 14
+  FontColor #000000
+  BackGroundColor #FFFFFF
+  LineColor #000000
+  LineThickness 0.75
+  RoundCorner 0
+  Shadowing 0
+}
+
+title {
+  FontSize 18
+  FontStyle bold
+  FontColor #000000
+  BackGroundColor transparent
+  LineColor transparent
+  LineThickness 0
+}
+
+note {
+  FontSize 12
+  BackGroundColor #FFFFFF
+  LineColor #000000
+  FontColor #000000
+}
+
+actor {
+  BackGroundColor #FFFFFF
+  LineColor #000000
+  LineThickness 0.75
+  FontColor #000000
+}
+usecase {
+  BackGroundColor #FFFDD0
+  LineColor #000000
+  FontColor #000000
+}
+rectangle {
+  BackGroundColor #FFFFFF
+  LineColor #000000
+  FontColor #000000
+}
+arrow {
+  LineColor #000000
+  LineThickness 0.75
+  FontColor #000000
+}
+</style>
+
+' Source: problem statement :: "Người chơi"
+actor "Người chơi" as Player
+' Source: problem statement :: người tạo phòng là Chủ phòng đầu tiên và vẫn chơi theo luật chung
+actor "Chủ phòng" as Host
+
+' Source: problem statement :: Chủ phòng được chia vai và chơi theo luật chung
+Host -down-|> Player
+
+rectangle "Hệ thống chơi Ma Sói qua mạng" as System {
+  ' Source: visual reference :: use case "Đăng nhập"
+  usecase "Đăng nhập" as UC_Login
+  ' Source: problem statement :: hệ thống chơi theo phòng, nhiều phòng chạy song song
+  usecase "Xem danh sách phòng" as UC_ListRooms
+  ' Source: problem statement and visual reference :: tạo, vào, rời phòng
+  usecase "Tạo, vào hoặc\nrời phòng" as UC_ManageRoom
+
+  ' Source: problem statement :: người chơi nhận vai bí mật
+  usecase "Nhận vai bí mật" as UC_ReceiveRole
+  ' Source: problem statement :: người chơi hành động theo vai và theo pha
+  usecase "Thực hiện hành động\ntheo vai và pha" as UC_RoleAction
+  ' Source: problem statement :: người chơi chat
+  usecase "Chat trong phòng" as UC_RoomChat
+  ' Source: problem statement :: người chơi bỏ phiếu
+  usecase "Bỏ phiếu" as UC_Vote
+  ' Source: problem statement :: server sở hữu pha, đồng hồ, sống/chết
+  usecase "Theo dõi pha, thời gian\nvà kết quả" as UC_TrackGame
+  ' Source: problem statement :: server gửi thông tin theo quyền
+  usecase "Nhận thông tin\ntheo quyền" as UC_AuthorizedInfo
+
+  ' Source: problem statement :: Chủ phòng có quyền mời người vào phòng và loại thành viên khi đang chờ
+  usecase "Mời hoặc loại\nthành viên" as UC_ManageMember
+  ' Source: problem statement :: Chủ phòng có quyền bắt đầu ván khi đang chờ
+  usecase "Bắt đầu ván" as UC_StartGame
+
+  UC_Login -[hidden]down-> UC_ListRooms
+  UC_ListRooms -[hidden]down-> UC_ManageRoom
+  UC_ManageRoom -[hidden]down-> UC_ReceiveRole
+  UC_ReceiveRole -[hidden]down-> UC_RoleAction
+  UC_RoleAction -[hidden]down-> UC_RoomChat
+  UC_RoomChat -[hidden]down-> UC_Vote
+  UC_Vote -[hidden]down-> UC_TrackGame
+  UC_TrackGame -[hidden]down-> UC_AuthorizedInfo
+
+  UC_ManageMember -[hidden]down-> UC_StartGame
+}
+
+' Source: visual reference :: người chơi đăng nhập
+UC_Login -left- Player
+' Source: problem statement :: hệ thống chơi theo phòng
+UC_ListRooms -left- Player
+' Source: problem statement :: người chơi tham gia theo phòng
+UC_ManageRoom -left- Player
+' Source: problem statement :: người chơi nhận vai bí mật
+UC_ReceiveRole -left- Player
+' Source: problem statement :: người chơi hành động theo vai và pha
+UC_RoleAction -left- Player
+' Source: problem statement :: người chơi chat
+UC_RoomChat -left- Player
+' Source: problem statement :: người chơi bỏ phiếu
+UC_Vote -left- Player
+' Source: problem statement :: server quản lý pha, đồng hồ, sống/chết và kết quả
+UC_TrackGame -left- Player
+' Source: problem statement :: server gửi thông tin theo quyền
+UC_AuthorizedInfo -left- Player
+
+' Source: problem statement :: quyền riêng của Chủ phòng khi phòng đang chờ
+UC_ManageMember -left- Host
+' Source: problem statement :: quyền riêng của Chủ phòng khi phòng đang chờ
+UC_StartGame -left- Host
+
+note right of UC_AuthorizedInfo
+Sói: thấy kênh chat riêng.
+Tiên tri: nhận kết quả soi.
+Dân làng: chỉ thấy thông báo chung.
+
+Server lọc dữ liệu trước khi gửi;
+client không nhận thông tin vượt quyền.
+end note
+
+@enduml
