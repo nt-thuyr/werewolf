@@ -373,11 +373,11 @@ static bool test_helpers_and_unimplemented_handlers(void)
     struct game_command command = {.type = GAME_COMMAND_NONE};
     struct game saved = empty;
     CHECK(game_handle_command(&empty, 1, 0, &command, &events) ==
-          GAME_RESULT_INTERNAL);
+          GAME_RESULT_INVALID_PAYLOAD);
     CHECK(events.count == 0);
     CHECK(memcmp(&empty, &saved, sizeof empty) == 0);
     events.count = 10;
-    CHECK(game_handle_timeout(&empty, 0, &events) == GAME_RESULT_INTERNAL);
+    CHECK(game_handle_timeout(&empty, 0, &events) == GAME_RESULT_OK);
     CHECK(events.count == 0);
     CHECK(memcmp(&empty, &saved, sizeof empty) == 0);
     events.count = 10;

@@ -95,6 +95,8 @@ struct game_player
 struct game
 {
     bool initialized;
+    /* Đêm đã chốt và có người chết, đang chờ SERVER-10 xét thắng. */
+    bool awaiting_win_check;
     enum game_phase phase;
     enum game_faction winner;
     uint8_t player_count;

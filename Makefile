@@ -5,6 +5,7 @@ BUILD_DIR := build
 COMMON_SOURCE := src/common/protocol.c
 COMMON_HEADERS := include/net_config.h include/protocol.h
 GAME_TEST := $(BUILD_DIR)/test_game
+GAME_NIGHT_TEST := $(BUILD_DIR)/test_game_night
 
 .PHONY: all clean test-game
 
@@ -19,11 +20,15 @@ $(BUILD_DIR)/client: src/client/main.c src/client/lobby.c include/client/lobby.h
 $(GAME_TEST): tests/game.c src/server/game.c include/server/game.h include/protocol.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
-test-game: $(GAME_TEST)
+$(GAME_NIGHT_TEST): tests/game_night.c src/server/game.c include/server/game.h include/protocol.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+test-game: $(GAME_TEST) $(GAME_NIGHT_TEST)
 	./$(GAME_TEST)
+	./$(GAME_NIGHT_TEST)
 
 $(BUILD_DIR):
 	mkdir -p $@
 
 clean:
-	$(RM) $(BUILD_DIR)/server $(BUILD_DIR)/client $(GAME_TEST)
+	$(RM) $(BUILD_DIR)/server $(BUILD_DIR)/client $(GAME_TEST) $(GAME_NIGHT_TEST)
