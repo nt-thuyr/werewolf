@@ -799,6 +799,9 @@ static bool handle_message(struct client *client, const struct message_header *h
             case MSG_START_GAME_REQ:
                 puts("Start accepted; waiting for role and phase from server");
                 break;
+            case MSG_NIGHT_ACTION_REQ: puts("Night action accepted"); break;
+            case MSG_CHAT_MSG: puts("Chat sent"); break;
+            case MSG_DAY_VOTE_REQ: puts("Vote accepted"); break;
             default: return false;
             }
         }
