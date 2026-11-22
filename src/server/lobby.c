@@ -206,13 +206,16 @@ uint8_t lobby_handle_request(struct lobby *lobby, struct session *session,
     if (session->room != NULL) {
         return ERR_UNAUTHORIZED;
     }
-    if (header->type == MSG_CREATE_ROOM_REQ) {
+    switch (header->type) {
+    case MSG_ROOM_LIST_REQ:
+        return ERR_SUCCESS;
+    case MSG_CREATE_ROOM_REQ:
         return create_room(lobby, session, name, capacity);
-    }
-    if (header->type == MSG_JOIN_ROOM_REQ) {
+    case MSG_JOIN_ROOM_REQ:
         return join_room(lobby, session, protocol_get_u32(body));
+    default:
+        return ERR_INVALID_PAYLOAD;
     }
-    return ERR_SUCCESS;
 }
 
 void lobby_finish_request(struct session *session, uint8_t type,
