@@ -1,4 +1,5 @@
 #include "client/lobby.h"
+#include "client/tui.h"
 #include "protocol.h"
 
 #include <arpa/inet.h>
@@ -6,8 +7,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <locale.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,14 +67,117 @@ struct client {
     bool command_too_long;
 };
 
-static void prompt(void)
+static bool rich_terminal;
+
+#define ANSI_RESET   "\x1b[0m"
+#define ANSI_BOLD    "\x1b[1m"
+#define ANSI_DIM     "\x1b[2m"
+#define ANSI_RED     "\x1b[31m"
+#define ANSI_GREEN   "\x1b[32m"
+#define ANSI_YELLOW  "\x1b[33m"
+#define ANSI_BLUE    "\x1b[34m"
+#define ANSI_MAGENTA "\x1b[35m"
+#define ANSI_CYAN    "\x1b[36m"
+
+static void print_name(const char *name);
+static void refresh_tui(const struct client *client);
+
+static void show_message(enum tui_log_kind kind, const char *format, ...)
 {
+    va_list arguments;
+    va_start(arguments, format);
+    if (tui_is_active()) {
+        char message[PROTOCOL_MAX_CHAT_BYTES + 160];
+        vsnprintf(message, sizeof message, format, arguments);
+        tui_log(kind, "%s", message);
+    } else {
+        vprintf(format, arguments);
+        putchar('\n');
+    }
+    va_end(arguments);
+}
+
+static void set_style(const char *style)
+{
+    if (rich_terminal) {
+        fputs(style, stdout);
+    }
+}
+
+static void print_rule(const char *title, const char *color)
+{
+    if (!rich_terminal) {
+        return;
+    }
+    set_style(color);
+    set_style(ANSI_BOLD);
+    printf("\n==================== %s ====================\n", title);
+    set_style(ANSI_RESET);
+}
+
+static const char *prompt_state(const struct client *client)
+{
+    if (client->room.id == 0) {
+        return "LOBBY";
+    }
+    if (!client->game.active) {
+        return client->room.self_id == client->room.host_id ? "ROOM/HOST" : "ROOM";
+    }
+    if (client->game.over) {
+        return "GAME OVER";
+    }
+    switch (client->game.phase) {
+    case PROTOCOL_PHASE_NIGHT: return "NIGHT";
+    case PROTOCOL_PHASE_DAY_DISCUSS: return "DAY/CHAT";
+    case PROTOCOL_PHASE_DAY_VOTE: return "DAY/VOTE";
+    }
+    return "GAME";
+}
+
+static const char *prompt_color(const struct client *client)
+{
+    if (client->game.active && !client->game.over) {
+        if (client->game.phase == PROTOCOL_PHASE_NIGHT) return ANSI_MAGENTA;
+        if (client->game.phase == PROTOCOL_PHASE_DAY_VOTE) return ANSI_YELLOW;
+        return ANSI_CYAN;
+    }
+    return client->room.id == 0 ? ANSI_BLUE : ANSI_GREEN;
+}
+
+static void prompt(const struct client *client)
+{
+    if (tui_is_active()) {
+        refresh_tui(client);
+        return;
+    }
+    if (rich_terminal) {
+        set_style(ANSI_BOLD);
+        set_style(prompt_color(client));
+        print_name(client->username);
+        printf(" [%s]", prompt_state(client));
+        set_style(ANSI_RESET);
+    }
     fputs("> ", stdout);
     fflush(stdout);
 }
 
 static void print_commands(void)
 {
+    if (tui_is_active()) {
+        tui_log(TUI_LOG_SYSTEM, "Lobby: list | create <name> <5-12> | join <room_id>");
+        tui_log(TUI_LOG_SYSTEM, "Room: invite <username> | kick <player_id> | leave | start");
+        tui_log(TUI_LOG_SYSTEM, "Game: act <player_id> | chat <text> | vote <player_id|0>");
+        tui_log(TUI_LOG_SYSTEM, "Info: status | help");
+        return;
+    }
+    if (rich_terminal) {
+        print_rule("COMMANDS", ANSI_BLUE);
+        puts("  Lobby : list | create <name> <5-12> | join <room_id>");
+        puts("          invite <username> | kick <player_id> | leave | start");
+        puts("  Game  : act <player_id> | chat <text> | vote <player_id|0>");
+        puts("  Info  : status | help");
+        return;
+    }
     puts("Commands: list | create <name> <5-12> | join <room_id> | "
          "invite <username> | kick <player_id> | leave | start | "
          "act <player_id> | chat <text> | vote <player_id|0> | status | help");
@@ -154,7 +260,7 @@ static void queue_command(struct client *client)
         ++command;
     }
     if (*command == '\0') {
-        prompt();
+        prompt(client);
         return;
     }
     char *argument = command;
@@ -170,20 +276,20 @@ static void queue_command(struct client *client)
 
     if (strcmp(command, "help") == 0 && argument[0] == '\0') {
         print_commands();
-        prompt();
+        prompt(client);
         return;
     }
     if (strcmp(command, "status") == 0 && argument[0] == '\0') {
         print_game_status(client);
-        prompt();
+        prompt(client);
         return;
     }
 
     if (client->game.active && !client->game.over) {
         if (strcmp(command, "chat") == 0 && argument[0] != '\0') {
             if (!game_self_alive(client)) {
-                puts("Dead players can only observe");
-                prompt();
+                show_message(TUI_LOG_ERROR, "Dead players can only observe");
+                prompt(client);
                 return;
             }
             uint8_t scope;
@@ -193,65 +299,66 @@ static void queue_command(struct client *client)
                        client->game.role == PROTOCOL_ROLE_WEREWOLF) {
                 scope = PROTOCOL_CHAT_WEREWOLF;
             } else {
-                puts("Chat is not available in this phase");
-                prompt();
+                show_message(TUI_LOG_ERROR, "Chat is not available in this phase");
+                prompt(client);
                 return;
             }
             size_t text_length = strlen(argument);
             if (text_length > PROTOCOL_MAX_CHAT_BYTES ||
                 memchr(argument, '\0', text_length) != NULL) {
-                puts("Chat message is too long or invalid");
-                prompt();
+                show_message(TUI_LOG_ERROR, "Chat message is too long or invalid");
+                prompt(client);
                 return;
             }
             body[0] = scope;
             memcpy(body + 1, argument, text_length);
             if (!queue_request(client, MSG_CHAT_MSG, body, 1 + text_length)) {
-                puts("Could not queue chat message");
-                prompt();
+                show_message(TUI_LOG_ERROR, "Could not queue chat message");
+                prompt(client);
             }
             return;
         }
         if (strcmp(command, "act") == 0) {
             uint32_t target_id;
             if (!game_self_alive(client)) {
-                puts("Dead players can only observe");
+                show_message(TUI_LOG_ERROR, "Dead players can only observe");
             } else if (client->game.phase != PROTOCOL_PHASE_NIGHT) {
-                puts("Night actions are only available at night");
+                show_message(TUI_LOG_ERROR, "Night actions are only available at night");
             } else if (!parse_number(argument, &target_id)) {
-                puts("Usage: act <player_id>");
+                show_message(TUI_LOG_ERROR, "Usage: act <player_id>");
             } else {
                 protocol_put_u32(body, target_id);
                 if (!queue_request(client, MSG_NIGHT_ACTION_REQ, body, 4)) {
-                    puts("Could not queue night action");
+                    show_message(TUI_LOG_ERROR, "Could not queue night action");
                 }
             }
             if (client->pending_type == 0) {
-                prompt();
+                prompt(client);
             }
             return;
         }
         if (strcmp(command, "vote") == 0) {
             uint32_t target_id;
             if (!game_self_alive(client)) {
-                puts("Dead players can only observe");
+                show_message(TUI_LOG_ERROR, "Dead players can only observe");
             } else if (client->game.phase != PROTOCOL_PHASE_DAY_VOTE) {
-                puts("Voting is only available during the vote phase");
+                show_message(TUI_LOG_ERROR, "Voting is only available during the vote phase");
             } else if (!parse_vote_target(argument, &target_id)) {
-                puts("Usage: vote <player_id|0>");
+                show_message(TUI_LOG_ERROR, "Usage: vote <player_id|0>");
             } else {
                 protocol_put_u32(body, target_id);
                 if (!queue_request(client, MSG_DAY_VOTE_REQ, body, 4)) {
-                    puts("Could not queue vote");
+                    show_message(TUI_LOG_ERROR, "Could not queue vote");
                 }
             }
             if (client->pending_type == 0) {
-                prompt();
+                prompt(client);
             }
             return;
         }
-        puts("Only game actions, chat, vote, status, and help are available during a game");
-        prompt();
+        show_message(TUI_LOG_ERROR,
+                     "Only game actions, chat, vote, status, and help are available during a game");
+        prompt(client);
         return;
     }
 
@@ -288,25 +395,25 @@ static void queue_command(struct client *client)
         type = MSG_LEAVE_ROOM_REQ;
     } else if (strcmp(command, "start") == 0 && first == NULL) {
         if (client->room.id == 0) {
-            puts("Join or create a room first");
-            prompt();
+            show_message(TUI_LOG_ERROR, "Join or create a room first");
+            prompt(client);
             return;
         }
         if (client->room.self_id != client->room.host_id) {
-            puts("Only the host can start the game");
-            prompt();
+            show_message(TUI_LOG_ERROR, "Only the host can start the game");
+            prompt(client);
             return;
         }
         type = MSG_START_GAME_REQ;
     } else {
         print_commands();
-        prompt();
+        prompt(client);
         return;
     }
 
     if (!queue_request(client, type, body, length)) {
-        puts("Could not queue request");
-        prompt();
+        show_message(TUI_LOG_ERROR, "Could not queue request");
+        prompt(client);
     }
 }
 
@@ -341,7 +448,11 @@ static bool print_room_list(const uint8_t *body, size_t length)
     }
     uint16_t count = protocol_get_u16(body);
     size_t offset = 2;
-    printf("Rooms: %u\n", (unsigned)count);
+    if (tui_is_active()) {
+        tui_log(TUI_LOG_SYSTEM, "Rooms: %u", (unsigned)count);
+    } else {
+        printf("Rooms: %u\n", (unsigned)count);
+    }
     for (size_t i = 0; i < count; ++i) {
         if (length - offset < 4) {
             return false;
@@ -359,9 +470,14 @@ static bool print_room_list(const uint8_t *body, size_t length)
             capacity < PROTOCOL_MIN_PLAYERS || capacity > PROTOCOL_MAX_PLAYERS) {
             return false;
         }
-        printf("  room_id=%" PRIu32 " ", id);
-        print_name(name);
-        printf(" (%u/%u)\n", players, capacity);
+        if (tui_is_active()) {
+            tui_log(TUI_LOG_SYSTEM, "Room #%" PRIu32 "  %s  (%u/%u)",
+                    id, name, players, capacity);
+        } else {
+            printf("  room_id=%" PRIu32 " ", id);
+            print_name(name);
+            printf(" (%u/%u)\n", players, capacity);
+        }
     }
     return offset == length;
 }
@@ -401,15 +517,37 @@ static bool update_room(struct client *client, const uint8_t *body, size_t lengt
 
     // Chỉ cập nhật trạng thái sau khi kiểm tra đủ dữ liệu.
     client->room = room;
-    printf("\nRoom update: room_id=%" PRIu32 " host_id=%" PRIu32 " self_id=%" PRIu32 "\n",
-           room.id, room.host_id, room.self_id);
+    if (tui_is_active()) {
+        tui_log(TUI_LOG_SYSTEM, "Room updated: #%" PRIu32 " with %u player(s)%s",
+                room.id, (unsigned)room.count,
+                room.self_id == room.host_id ? "; you are the host" : "");
+        refresh_tui(client);
+        return true;
+    }
+    print_rule("ROOM", ANSI_GREEN);
+    set_style(ANSI_CYAN);
+    printf("%sRoom update: room_id=%" PRIu32 " host_id=%" PRIu32 " self_id=%" PRIu32 "\n",
+           rich_terminal ? "" : "\n", room.id, room.host_id, room.self_id);
+    set_style(ANSI_RESET);
     for (size_t i = 0; i < client->room.count; ++i) {
         const struct player *player = &client->room.players[i];
         printf("  %" PRIu32 " ", player->id);
         print_name(player->name);
+        if (rich_terminal && player->id == room.host_id) {
+            set_style(ANSI_YELLOW);
+            fputs(" [HOST]", stdout);
+            set_style(ANSI_RESET);
+        }
+        if (rich_terminal && player->id == room.self_id) {
+            set_style(ANSI_CYAN);
+            fputs(" [YOU]", stdout);
+            set_style(ANSI_RESET);
+        }
         putchar('\n');
     }
+    set_style(room.self_id == room.host_id ? ANSI_YELLOW : ANSI_GREEN);
     puts(room.self_id == room.host_id ? "You are the host" : "You are a member");
+    set_style(ANSI_RESET);
     return true;
 }
 
@@ -432,6 +570,49 @@ static const char *room_player_name(const struct client *client,
         }
     }
     return NULL;
+}
+
+static void refresh_tui(const struct client *client)
+{
+    if (!tui_is_active()) return;
+    struct tui_view view = {
+        .username = client->username,
+        .room_id = client->room.id,
+        .is_host = client->room.id != 0 &&
+                   client->room.self_id == client->room.host_id,
+        .game_active = client->game.active,
+        .game_over = client->game.over,
+        .role = client->game.role,
+        .phase = client->game.phase,
+        .duration_sec = client->game.duration_sec
+    };
+    if (client->game.active) {
+        view.player_count = client->game.player_count;
+        for (size_t i = 0; i < view.player_count; ++i) {
+            uint32_t id = client->game.player_ids[i];
+            const char *name = room_player_name(client, id);
+            view.players[i] = (struct tui_player_view){
+                .id = id,
+                .name = name == NULL ? "(left room)" : name,
+                .alive = client->game.alive[i],
+                .alive_known = true,
+                .is_self = id == client->room.self_id,
+                .is_host = id == client->room.host_id
+            };
+        }
+    } else {
+        view.player_count = client->room.count;
+        for (size_t i = 0; i < view.player_count; ++i) {
+            const struct player *player = &client->room.players[i];
+            view.players[i] = (struct tui_player_view){
+                .id = player->id,
+                .name = player->name,
+                .is_self = player->id == client->room.self_id,
+                .is_host = player->id == client->room.host_id
+            };
+        }
+    }
+    tui_draw(&view, client->command);
 }
 
 static void print_player_id(const struct client *client, uint32_t player_id)
@@ -477,6 +658,54 @@ static const char *phase_name(enum protocol_phase phase)
 
 static void print_game_status(const struct client *client)
 {
+    if (tui_is_active()) {
+        tui_log(TUI_LOG_SYSTEM, "Status refreshed");
+        refresh_tui(client);
+        return;
+    }
+    if (rich_terminal) {
+        print_rule("STATUS", ANSI_CYAN);
+        printf("  Player : ");
+        set_style(ANSI_BOLD);
+        print_name(client->username);
+        set_style(ANSI_RESET);
+        printf("\n  Room   : %s", client->room.id == 0 ? "Lobby" : "Joined");
+        if (client->room.id != 0) {
+            printf(" #%" PRIu32 "%s", client->room.id,
+                   client->room.self_id == client->room.host_id ? " (Host)" : "");
+        }
+        putchar('\n');
+        if (!client->game.active) {
+            puts("  Game   : Waiting");
+            return;
+        }
+        if (client->game.over) {
+            puts("  Game   : Over; waiting for the next game");
+            return;
+        }
+        printf("  Role   : %s\n", role_name(client->game.role));
+        printf("  Phase  : %s (%u seconds)\n", phase_name(client->game.phase),
+               (unsigned)client->game.duration_sec);
+        puts("\n  ID   PLAYER                         STATE");
+        puts("  ---- ------------------------------ --------");
+        for (size_t i = 0; i < client->game.player_count; ++i) {
+            uint32_t id = client->game.player_ids[i];
+            printf("  %-4" PRIu32 " ", id);
+            const char *name = room_player_name(client, id);
+            if (name != NULL) {
+                print_name(name);
+            } else {
+                printf("player #%" PRIu32, id);
+            }
+            if (id == client->room.self_id) fputs(" [YOU]", stdout);
+            if (id == client->room.host_id) fputs(" [HOST]", stdout);
+            fputs("\t", stdout);
+            set_style(client->game.alive[i] ? ANSI_GREEN : ANSI_DIM);
+            puts(client->game.alive[i] ? "ALIVE" : "DEAD");
+            set_style(ANSI_RESET);
+        }
+        return;
+    }
     if (!client->game.active) {
         puts(client->room.id == 0 ? "You are in the lobby" : "You are in a room");
         return;
@@ -538,7 +767,17 @@ static bool handle_game_push(struct client *client,
             start_game_view(client);
         }
         client->game.role = (enum protocol_role)body[0];
-        printf("\nGame started. Your role is %s\n", role_name(client->game.role));
+        if (tui_is_active()) {
+            tui_log(client->game.role == PROTOCOL_ROLE_WEREWOLF
+                        ? TUI_LOG_WOLVES : TUI_LOG_SUCCESS,
+                    "Game started. Your role is %s",
+                    role_name(client->game.role));
+        }
+        print_rule("GAME STARTED", ANSI_YELLOW);
+        set_style(client->game.role == PROTOCOL_ROLE_WEREWOLF ? ANSI_RED : ANSI_CYAN);
+        printf("%sGame started. Your role is %s\n", rich_terminal ? "" : "\n",
+               role_name(client->game.role));
+        set_style(ANSI_RESET);
         return true;
     case MSG_WOLF_TEAM_INFO: {
         if (header->length < 1 || client->game.role != PROTOCOL_ROLE_WEREWOLF) {
@@ -568,12 +807,21 @@ static bool handle_game_push(struct client *client,
         }
         client->game.wolf_count = count;
         memcpy(client->game.wolf_ids, ids, count * sizeof ids[0]);
+        if (tui_is_active()) {
+            for (size_t i = 0; i < count; ++i) {
+                const char *name = room_player_name(client, ids[i]);
+                tui_log(TUI_LOG_WOLVES, "Wolf teammate: %s (#%" PRIu32 ")",
+                        name == NULL ? "unknown" : name, ids[i]);
+            }
+        }
+        set_style(ANSI_RED);
         fputs("Wolf team:", stdout);
         for (size_t i = 0; i < count; ++i) {
             fputs(" ", stdout);
             print_player_id(client, ids[i]);
         }
         putchar('\n');
+        set_style(ANSI_RESET);
         return true;
     }
     case MSG_PHASE_CHANGE: {
@@ -591,8 +839,21 @@ static bool handle_game_push(struct client *client,
         client->game.phase = (enum protocol_phase)body[0];
         client->game.duration_sec = duration;
         client->game.deadline_ms = protocol_get_u64(body + 3);
-        printf("\nPhase: %s (%u seconds)\n", phase_name(client->game.phase),
-               (unsigned)duration);
+        if (tui_is_active()) {
+            tui_log(client->game.phase == PROTOCOL_PHASE_NIGHT
+                        ? TUI_LOG_NIGHT : client->game.phase == PROTOCOL_PHASE_DAY_VOTE
+                        ? TUI_LOG_VOTE : TUI_LOG_SYSTEM,
+                    "Phase changed to %s (%u seconds)",
+                    phase_name(client->game.phase), (unsigned)duration);
+        }
+        const char *phase_color = client->game.phase == PROTOCOL_PHASE_NIGHT
+            ? ANSI_MAGENTA : client->game.phase == PROTOCOL_PHASE_DAY_VOTE
+            ? ANSI_YELLOW : ANSI_CYAN;
+        print_rule(phase_name(client->game.phase), phase_color);
+        set_style(phase_color);
+        printf("%sPhase: %s (%u seconds)\n", rich_terminal ? "" : "\n",
+               phase_name(client->game.phase), (unsigned)duration);
+        set_style(ANSI_RESET);
         if (client->game.phase == PROTOCOL_PHASE_NIGHT) {
             puts("Use act <player_id> if your role has a night action");
             if (client->game.role == PROTOCOL_ROLE_WEREWOLF) {
@@ -611,9 +872,18 @@ static bool handle_game_push(struct client *client,
                                              protocol_get_u32(body)) < 0) {
             return false;
         }
+        if (tui_is_active()) {
+            uint32_t id = protocol_get_u32(body);
+            const char *name = room_player_name(client, id);
+            tui_log(TUI_LOG_NIGHT, "Seer result: %s (#%" PRIu32 ") is %sa werewolf",
+                    name == NULL ? "unknown" : name, id, body[4] ? "" : "not ");
+        }
+        set_style(ANSI_MAGENTA);
+        if (rich_terminal) fputs("[Seer] ", stdout);
         fputs("Seer result: ", stdout);
         print_player_id(client, protocol_get_u32(body));
         puts(body[4] ? " is a werewolf" : " is not a werewolf");
+        set_style(ANSI_RESET);
         return true;
     }
     case MSG_WOLF_TARGET_UPDATE: {
@@ -626,11 +896,21 @@ static bool handle_game_push(struct client *client,
             game_player_index(&client->game, target_id) < 0) {
             return false;
         }
+        if (tui_is_active()) {
+            const char *wolf_name = room_player_name(client, wolf_id);
+            const char *target_name = room_player_name(client, target_id);
+            tui_log(TUI_LOG_WOLVES, "%s chose %s as wolf target",
+                    wolf_name == NULL ? "A wolf" : wolf_name,
+                    target_name == NULL ? "unknown" : target_name);
+        }
+        set_style(ANSI_RED);
+        if (rich_terminal) fputs("[Wolves] ", stdout);
         fputs("Wolf target: ", stdout);
         print_player_id(client, wolf_id);
         fputs(" chose ", stdout);
         print_player_id(client, target_id);
         putchar('\n');
+        set_style(ANSI_RESET);
         return true;
     }
     case MSG_NIGHT_RESULT:
@@ -647,6 +927,17 @@ static bool handle_game_push(struct client *client,
             client->game.alive[index] = false;
         }
         if (header->type == MSG_NIGHT_RESULT) {
+            if (tui_is_active()) {
+                const char *name = room_player_name(client, player_id);
+                if (player_id == 0) {
+                    tui_log(TUI_LOG_NIGHT, "Nobody died tonight");
+                } else {
+                    tui_log(TUI_LOG_NIGHT, "%s (#%" PRIu32 ") died tonight",
+                            name == NULL ? "A player" : name, player_id);
+                }
+            }
+            set_style(ANSI_MAGENTA);
+            if (rich_terminal) fputs("[Night] ", stdout);
             if (player_id == 0) {
                 puts("Night result: nobody died");
             } else {
@@ -655,12 +946,24 @@ static bool handle_game_push(struct client *client,
                 puts(" died");
             }
         } else if (player_id == 0) {
+            if (tui_is_active())
+                tui_log(TUI_LOG_VOTE, "Nobody was executed");
+            set_style(ANSI_YELLOW);
+            if (rich_terminal) fputs("[Vote] ", stdout);
             puts("Day result: nobody was executed");
         } else {
+            if (tui_is_active()) {
+                const char *name = room_player_name(client, player_id);
+                tui_log(TUI_LOG_VOTE, "%s (#%" PRIu32 ") was executed",
+                        name == NULL ? "A player" : name, player_id);
+            }
+            set_style(ANSI_YELLOW);
+            if (rich_terminal) fputs("[Vote] ", stdout);
             fputs("Day result: ", stdout);
             print_player_id(client, player_id);
             puts(" was executed");
         }
+        set_style(ANSI_RESET);
         return true;
     }
     case MSG_CHAT_NOTIF: {
@@ -675,6 +978,7 @@ static bool handle_game_push(struct client *client,
              client->game.role != PROTOCOL_ROLE_WEREWOLF)) {
             return false;
         }
+        set_style(body[0] == PROTOCOL_CHAT_WEREWOLF ? ANSI_RED : ANSI_GREEN);
         fputs(body[0] == PROTOCOL_CHAT_WEREWOLF ? "[Wolves] " : "[Village] ",
               stdout);
         print_player_id(client, from_id);
@@ -683,8 +987,15 @@ static bool handle_game_push(struct client *client,
         size_t message_length = header->length - 5;
         memcpy(message, body + 5, message_length);
         message[message_length] = '\0';
+        if (tui_is_active()) {
+            const char *name = room_player_name(client, from_id);
+            tui_log(body[0] == PROTOCOL_CHAT_WEREWOLF
+                        ? TUI_LOG_WOLVES : TUI_LOG_VILLAGE,
+                    "%s: %s", name == NULL ? "unknown" : name, message);
+        }
         print_name(message);
         putchar('\n');
+        set_style(ANSI_RESET);
         return true;
     }
     case MSG_GAME_OVER: {
@@ -697,12 +1008,23 @@ static bool handle_game_push(struct client *client,
         client->game.over = true;
         client->game.winner = (enum protocol_faction)body[0];
         client->game.phase = 0;
+        if (tui_is_active()) {
+            tui_log(body[0] == PROTOCOL_FACTION_WEREWOLF
+                        ? TUI_LOG_WOLVES : TUI_LOG_SUCCESS,
+                    "%s", body[0] == PROTOCOL_FACTION_VILLAGE
+                        ? "Game over: village wins"
+                        : body[0] == PROTOCOL_FACTION_WEREWOLF
+                        ? "Game over: werewolves win"
+                        : "Game over: game cancelled");
+        }
+        print_rule("GAME OVER", ANSI_YELLOW);
+        set_style(body[0] == PROTOCOL_FACTION_WEREWOLF ? ANSI_RED : ANSI_GREEN);
         if (body[0] == PROTOCOL_FACTION_VILLAGE) {
-            puts("\nGame over: village wins");
+            puts(rich_terminal ? "Game over: village wins" : "\nGame over: village wins");
         } else if (body[0] == PROTOCOL_FACTION_WEREWOLF) {
-            puts("\nGame over: werewolves win");
+            puts(rich_terminal ? "Game over: werewolves win" : "\nGame over: werewolves win");
         } else {
-            puts("\nGame over: game cancelled");
+            puts(rich_terminal ? "Game over: game cancelled" : "\nGame over: game cancelled");
         }
         if (header->length > 1) {
             char summary[PROTOCOL_MAX_SUMMARY_BYTES + 1];
@@ -713,6 +1035,7 @@ static bool handle_game_push(struct client *client,
             putchar('\n');
         }
         puts("You can keep watching room events");
+        set_style(ANSI_RESET);
         return true;
     }
     default:
@@ -736,7 +1059,14 @@ static void print_request_error(uint8_t status)
     case ERR_RATE_LIMITED: name = "ERR_RATE_LIMITED"; break;
     case ERR_INTERNAL: name = "ERR_INTERNAL"; break;
     }
+    if (tui_is_active()) {
+        tui_log(TUI_LOG_ERROR, "%s (0x%02X)", name, (unsigned)status);
+        return;
+    }
+    set_style(ANSI_RED);
+    if (rich_terminal) fputs("[Error] ", stdout);
     printf("%s (0x%02X)\n", name, (unsigned)status);
+    set_style(ANSI_RESET);
 }
 
 // Phân biệt cập nhật đẩy với phản hồi lệnh đang chờ.
@@ -756,9 +1086,15 @@ static bool handle_message(struct client *client, const struct message_header *h
             offset != header->length) {
             return false;
         }
+        if (tui_is_active()) {
+            tui_log(TUI_LOG_SYSTEM, "Invitation from %s: join room #%" PRIu32,
+                    host, protocol_get_u32(body));
+        }
+        set_style(ANSI_CYAN);
         fputs("\nInvitation from ", stdout);
         print_name(host);
         printf(": join %" PRIu32 "\n", protocol_get_u32(body));
+        set_style(ANSI_RESET);
         return true;
     }
     if (header->type == MSG_KICK_NOTIF) {
@@ -767,7 +1103,12 @@ static bool handle_message(struct client *client, const struct message_header *h
             return false;
         }
         client->room = (struct room_view){0};
+        if (tui_is_active()) {
+            tui_log(TUI_LOG_ERROR, "Kicked by host; returned to lobby");
+        }
+        set_style(ANSI_RED);
         puts("\nKicked by host; returned to lobby");
+        set_style(ANSI_RESET);
         return true;
     }
     if (game_push_type(header->type)) {
@@ -787,6 +1128,23 @@ static bool handle_message(struct client *client, const struct message_header *h
         } else if (client->pending_type == MSG_ROOM_LIST_REQ) {
             return false;
         } else {
+            if (tui_is_active()) {
+                const char *message = NULL;
+                switch (client->pending_type) {
+                case MSG_CREATE_ROOM_REQ: message = "Room created"; break;
+                case MSG_JOIN_ROOM_REQ: message = "Room joined"; break;
+                case MSG_INVITE_REQ: message = "Invitation sent"; break;
+                case MSG_KICK_REQ: message = "Player kicked"; break;
+                case MSG_LEAVE_ROOM_REQ: message = "Left room; returned to lobby"; break;
+                case MSG_START_GAME_REQ: message = "Start accepted; waiting for game"; break;
+                case MSG_NIGHT_ACTION_REQ: message = "Night action accepted"; break;
+                case MSG_CHAT_MSG: message = "Chat sent"; break;
+                case MSG_DAY_VOTE_REQ: message = "Vote accepted"; break;
+                default: break;
+                }
+                if (message != NULL) tui_log(TUI_LOG_SUCCESS, "%s", message);
+            }
+            set_style(ANSI_GREEN);
             switch (client->pending_type) {
             case MSG_CREATE_ROOM_REQ: puts("Room created"); break;
             case MSG_JOIN_ROOM_REQ: puts("Room joined"); break;
@@ -804,6 +1162,7 @@ static bool handle_message(struct client *client, const struct message_header *h
             case MSG_DAY_VOTE_REQ: puts("Vote accepted"); break;
             default: return false;
             }
+            set_style(ANSI_RESET);
         }
     } else {
         return false;
@@ -848,8 +1207,10 @@ static bool read_server(int fd, struct client *client)
         return false;
     }
     client->received = 0;
-    if (client->pending_type == 0) {
-        prompt();
+    if (tui_is_active()) {
+        refresh_tui(client);
+    } else if (client->pending_type == 0) {
+        prompt(client);
     } else {
         fflush(stdout);
     }
@@ -884,7 +1245,7 @@ static int read_command(struct client *client)
     if (ch == '\n') {
         if (client->command_too_long) {
             puts("Invalid command line");
-            prompt();
+            prompt(client);
         } else {
             client->command[client->command_length] = '\0';
             queue_command(client);
@@ -899,6 +1260,65 @@ static int read_command(struct client *client)
     return 1;
 }
 
+static void remove_last_utf8_character(char *text, size_t *length)
+{
+    if (*length == 0) return;
+    --*length;
+    while (*length != 0 &&
+           ((unsigned char)text[*length] & 0xc0) == 0x80) {
+        --*length;
+    }
+    text[*length] = '\0';
+}
+
+static int read_tui_command(struct client *client)
+{
+    for (;;) {
+        wchar_t character = 0;
+        enum tui_key key = tui_read_key(&character);
+        if (key == TUI_KEY_NONE) break;
+        if (key == TUI_KEY_EOF) return 0;
+        if (key == TUI_KEY_RESIZE) {
+            refresh_tui(client);
+            continue;
+        }
+        if (key == TUI_KEY_BACKSPACE) {
+            remove_last_utf8_character(client->command, &client->command_length);
+            client->command_too_long = false;
+            refresh_tui(client);
+            continue;
+        }
+        if (key == TUI_KEY_ENTER) {
+            if (client->command_too_long) {
+                show_message(TUI_LOG_ERROR, "Invalid command line");
+            } else {
+                client->command[client->command_length] = '\0';
+                queue_command(client);
+            }
+            client->command_length = 0;
+            client->command[0] = '\0';
+            client->command_too_long = false;
+            refresh_tui(client);
+            continue;
+        }
+        if (key == TUI_KEY_CHARACTER) {
+            char bytes[MB_LEN_MAX];
+            mbstate_t state = {0};
+            size_t count = wcrtomb(bytes, character, &state);
+            if (count == (size_t)-1 ||
+                count > sizeof client->command - 1 - client->command_length) {
+                client->command_too_long = true;
+            } else {
+                memcpy(client->command + client->command_length, bytes, count);
+                client->command_length += count;
+                client->command[client->command_length] = '\0';
+            }
+            refresh_tui(client);
+        }
+    }
+    return 1;
+}
+
 int run_lobby(int fd, const char *username)
 {
     setlocale(LC_CTYPE, "");
@@ -909,8 +1329,15 @@ int run_lobby(int fd, const char *username)
     }
 
     struct client client = {.username = username, .last_request_id = 1};
+    bool tui_enabled = tui_start();
+    rich_terminal = !tui_enabled && isatty(STDOUT_FILENO);
+    if (tui_enabled) {
+        tui_log(TUI_LOG_SUCCESS, "Logged in as %s", username);
+        tui_log(TUI_LOG_SYSTEM, "Press Ctrl+D to exit; type help for commands");
+    }
     print_commands();
-    prompt();
+    prompt(&client);
+    int outcome = EXIT_SUCCESS;
     for (;;) {
         struct pollfd sources[] = {
             {.fd = fd, .events = POLLIN},
@@ -925,31 +1352,40 @@ int run_lobby(int fd, const char *username)
                 continue;
             }
             perror("poll");
-            return EXIT_FAILURE;
+            outcome = EXIT_FAILURE;
+            break;
         }
         short events = sources[0].revents;
         if ((events & POLLOUT) && !write_request(fd, &client)) {
             fputs("Disconnected from server\n", stderr);
-            return EXIT_FAILURE;
+            outcome = EXIT_FAILURE;
+            break;
         }
         if (events & POLLIN) {
             if (!read_server(fd, &client)) {
-                return EXIT_FAILURE;
+                outcome = EXIT_FAILURE;
+                break;
             }
         } else if (events & (POLLERR | POLLHUP | POLLNVAL)) {
             fputs("Disconnected from server\n", stderr);
-            return EXIT_FAILURE;
+            outcome = EXIT_FAILURE;
+            break;
         }
         if (sources[1].revents & (POLLERR | POLLNVAL)) {
             fputs("Could not read terminal input\n", stderr);
-            return EXIT_FAILURE;
+            outcome = EXIT_FAILURE;
+            break;
         }
         if (sources[1].revents & (POLLIN | POLLHUP)) {
-            int result = read_command(&client);
+            int result = tui_enabled ? read_tui_command(&client)
+                                     : read_command(&client);
             if (result <= 0) {
-                return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+                outcome = result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+                break;
             }
         }
     }
+    tui_stop();
+    return outcome;
 }
 

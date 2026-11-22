@@ -16,7 +16,7 @@ Trong máy ảo Ubuntu hoặc Debian, cài công cụ và clone repo.
 
 ```bash
 sudo apt update
-sudo apt install git build-essential
+sudo apt install git build-essential libncurses-dev
 git clone https://github.com/nt-thuyr/werewolf.git
 cd werewolf
 make
@@ -35,6 +35,11 @@ Trong terminal thứ hai, mở cùng thư mục dự án rồi chạy client.
 ```bash
 ./build/client 127.0.0.1 alice
 ```
+
+Client tự mở giao diện TUI bằng ncurses khi stdin/stdout là terminal tương tác.
+Khi chạy qua pipe hoặc bộ kiểm thử, client tự quay về chế độ dòng lệnh thuần để
+giữ output ổn định. TUI cần cửa sổ tối thiểu 70 cột × 20 dòng; có thể thay đổi
+kích thước terminal trong lúc chạy.
 
 Mở terminal thứ ba và chạy `./build/client 127.0.0.1 bob`. Sau khi cả hai đăng nhập, nhập `create LangSoi 5` ở Alice. Ở Bob, nhập `list`, thử `join 9999` nếu ID này chưa tồn tại, rồi nhập `join <ID phòng vừa hiện>`. Để yên terminal Alice khi Bob tham gia. Cả hai client tự hiển thị cùng ID phòng, ID Chủ phòng và danh sách thành viên.
 
