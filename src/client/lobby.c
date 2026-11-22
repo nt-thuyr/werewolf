@@ -2,6 +2,7 @@
 #include "protocol.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -16,7 +17,7 @@
 #include <wctype.h>
 
 enum {
-    MAX_COMMAND = 128
+    MAX_COMMAND = PROTOCOL_MAX_CHAT_BYTES + 16
 };
 
 struct player {
@@ -32,11 +33,27 @@ struct room_view {
     struct player players[PROTOCOL_MAX_PLAYERS];
 };
 
+struct game_view {
+    bool active;
+    bool over;
+    enum protocol_role role;
+    enum protocol_phase phase;
+    enum protocol_faction winner;
+    uint16_t duration_sec;
+    uint64_t deadline_ms;
+    uint8_t player_count;
+    uint32_t player_ids[PROTOCOL_MAX_PLAYERS];
+    bool alive[PROTOCOL_MAX_PLAYERS];
+    uint8_t wolf_count;
+    uint32_t wolf_ids[PROTOCOL_MAX_PLAYERS];
+};
+
 struct client {
     const char *username;
     struct room_view room;
+    struct game_view game;
     uint8_t input[PROTOCOL_MAX_FRAME];
-    uint8_t output[PROTOCOL_HEADER_SIZE + PROTOCOL_MAX_NAME + 2];
+    uint8_t output[PROTOCOL_MAX_FRAME];
     size_t received;
     size_t queued;
     size_t sent;
@@ -56,7 +73,8 @@ static void prompt(void)
 static void print_commands(void)
 {
     puts("Commands: list | create <name> <5-12> | join <room_id> | "
-         "invite <username> | kick <player_id> | leave | start | help");
+         "invite <username> | kick <player_id> | leave | start | "
+         "act <player_id> | chat <text> | vote <player_id|0> | status | help");
 }
 
 static bool parse_number(const char *text, uint32_t *value)
@@ -74,59 +92,30 @@ static bool parse_number(const char *text, uint32_t *value)
     return true;
 }
 
-// Đổi lệnh terminal thành yêu cầu có request_id riêng.
-static void queue_command(struct client *client)
+static bool parse_vote_target(const char *text, uint32_t *value)
 {
-    uint8_t *body = client->output + PROTOCOL_HEADER_SIZE;
-    uint8_t type;
-    size_t length = 0;
-    char *command = strtok(client->command, " \t\r");
-    if (command == NULL) {
-        prompt();
-        return;
+    if (text == NULL || text[0] < '0' || text[0] > '9') {
+        return false;
     }
-
-    char *argument = strtok(NULL, " \t\r");
-    uint32_t number;
-    if (strcmp(command, "help") == 0 && argument == NULL) {
-        print_commands();
-        prompt();
-        return;
-    } else if (strcmp(command, "list") == 0 && argument == NULL) {
-        type = MSG_ROOM_LIST_REQ;
-    } else if (strcmp(command, "create") == 0 && argument != NULL &&
-               strlen(argument) <= PROTOCOL_MAX_NAME &&
-               parse_number(strtok(NULL, " \t\r"), &number) &&
-               number >= PROTOCOL_MIN_PLAYERS && number <= PROTOCOL_MAX_PLAYERS &&
-               strtok(NULL, " \t\r") == NULL) {
-        type = MSG_CREATE_ROOM_REQ;
-        length = protocol_put_name(body, argument);
-        body[length++] = (uint8_t)number;
-    } else if (strcmp(command, "join") == 0 && parse_number(argument, &number) &&
-               strtok(NULL, " \t\r") == NULL) {
-        type = MSG_JOIN_ROOM_REQ;
-        protocol_put_u32(body, number);
-        length = 4;
-    } else if (strcmp(command, "invite") == 0 && argument != NULL &&
-               strlen(argument) <= PROTOCOL_MAX_USERNAME &&
-               strtok(NULL, " \t\r") == NULL) {
-        type = MSG_INVITE_REQ;
-        length = protocol_put_name(body, argument);
-    } else if (strcmp(command, "kick") == 0 && parse_number(argument, &number) &&
-               strtok(NULL, " \t\r") == NULL) {
-        type = MSG_KICK_REQ;
-        protocol_put_u32(body, number);
-        length = 4;
-    } else if (strcmp(command, "leave") == 0 && argument == NULL) {
-        type = MSG_LEAVE_ROOM_REQ;
-    } else if (strcmp(command, "start") == 0 && argument == NULL) {
-        type = MSG_START_GAME_REQ;
-    } else {
-        print_commands();
-        prompt();
-        return;
+    char *end;
+    errno = 0;
+    unsigned long number = strtoul(text, &end, 10);
+    if (errno != 0 || *end != '\0' || number > UINT32_MAX) {
+        return false;
     }
+    *value = (uint32_t)number;
+    return true;
+}
 
+static bool queue_request(struct client *client, uint8_t type,
+                          const uint8_t *body, size_t length)
+{
+    if (client->pending_type != 0 || length > PROTOCOL_MAX_BODY) {
+        return false;
+    }
+    if (length != 0 && body != client->output + PROTOCOL_HEADER_SIZE) {
+        memmove(client->output + PROTOCOL_HEADER_SIZE, body, length);
+    }
     if (++client->last_request_id == 0) {
         ++client->last_request_id;
     }
@@ -139,6 +128,186 @@ static void queue_command(struct client *client)
     client->pending_type = type;
     client->queued = PROTOCOL_HEADER_SIZE + length;
     client->sent = 0;
+    return true;
+}
+
+static bool game_self_alive(const struct client *client)
+{
+    for (size_t i = 0; i < client->game.player_count; ++i) {
+        if (client->game.player_ids[i] == client->room.self_id) {
+            return client->game.alive[i];
+        }
+    }
+    return false;
+}
+
+static void print_game_status(const struct client *client);
+
+// Đổi lệnh terminal thành yêu cầu có request_id riêng.
+static void queue_command(struct client *client)
+{
+    uint8_t *body = client->output + PROTOCOL_HEADER_SIZE;
+    uint8_t type;
+    size_t length = 0;
+    char *command = client->command;
+    while (*command != '\0' && isspace((unsigned char)*command)) {
+        ++command;
+    }
+    if (*command == '\0') {
+        prompt();
+        return;
+    }
+    char *argument = command;
+    while (*argument != '\0' && !isspace((unsigned char)*argument)) {
+        ++argument;
+    }
+    if (*argument != '\0') {
+        *argument++ = '\0';
+        while (*argument != '\0' && isspace((unsigned char)*argument)) {
+            ++argument;
+        }
+    }
+
+    if (strcmp(command, "help") == 0 && argument[0] == '\0') {
+        print_commands();
+        prompt();
+        return;
+    }
+    if (strcmp(command, "status") == 0 && argument[0] == '\0') {
+        print_game_status(client);
+        prompt();
+        return;
+    }
+
+    if (client->game.active && !client->game.over) {
+        if (strcmp(command, "chat") == 0 && argument[0] != '\0') {
+            if (!game_self_alive(client)) {
+                puts("Dead players can only observe");
+                prompt();
+                return;
+            }
+            uint8_t scope;
+            if (client->game.phase == PROTOCOL_PHASE_DAY_DISCUSS) {
+                scope = PROTOCOL_CHAT_VILLAGE;
+            } else if (client->game.phase == PROTOCOL_PHASE_NIGHT &&
+                       client->game.role == PROTOCOL_ROLE_WEREWOLF) {
+                scope = PROTOCOL_CHAT_WEREWOLF;
+            } else {
+                puts("Chat is not available in this phase");
+                prompt();
+                return;
+            }
+            size_t text_length = strlen(argument);
+            if (text_length > PROTOCOL_MAX_CHAT_BYTES ||
+                memchr(argument, '\0', text_length) != NULL) {
+                puts("Chat message is too long or invalid");
+                prompt();
+                return;
+            }
+            body[0] = scope;
+            memcpy(body + 1, argument, text_length);
+            if (!queue_request(client, MSG_CHAT_MSG, body, 1 + text_length)) {
+                puts("Could not queue chat message");
+                prompt();
+            }
+            return;
+        }
+        if (strcmp(command, "act") == 0) {
+            uint32_t target_id;
+            if (!game_self_alive(client)) {
+                puts("Dead players can only observe");
+            } else if (client->game.phase != PROTOCOL_PHASE_NIGHT) {
+                puts("Night actions are only available at night");
+            } else if (!parse_number(argument, &target_id)) {
+                puts("Usage: act <player_id>");
+            } else {
+                protocol_put_u32(body, target_id);
+                if (!queue_request(client, MSG_NIGHT_ACTION_REQ, body, 4)) {
+                    puts("Could not queue night action");
+                }
+            }
+            if (client->pending_type == 0) {
+                prompt();
+            }
+            return;
+        }
+        if (strcmp(command, "vote") == 0) {
+            uint32_t target_id;
+            if (!game_self_alive(client)) {
+                puts("Dead players can only observe");
+            } else if (client->game.phase != PROTOCOL_PHASE_DAY_VOTE) {
+                puts("Voting is only available during the vote phase");
+            } else if (!parse_vote_target(argument, &target_id)) {
+                puts("Usage: vote <player_id|0>");
+            } else {
+                protocol_put_u32(body, target_id);
+                if (!queue_request(client, MSG_DAY_VOTE_REQ, body, 4)) {
+                    puts("Could not queue vote");
+                }
+            }
+            if (client->pending_type == 0) {
+                prompt();
+            }
+            return;
+        }
+        puts("Only game actions, chat, vote, status, and help are available during a game");
+        prompt();
+        return;
+    }
+
+    uint32_t number;
+    char *argument_copy = argument;
+    char *first = strtok(argument_copy, " \t\r");
+    char *second = strtok(NULL, " \t\r");
+    if (strcmp(command, "list") == 0 && first == NULL) {
+        type = MSG_ROOM_LIST_REQ;
+    } else if (strcmp(command, "create") == 0 && first != NULL &&
+               strlen(first) <= PROTOCOL_MAX_NAME &&
+               parse_number(second, &number) &&
+               number >= PROTOCOL_MIN_PLAYERS && number <= PROTOCOL_MAX_PLAYERS &&
+               strtok(NULL, " \t\r") == NULL) {
+        type = MSG_CREATE_ROOM_REQ;
+        length = protocol_put_name(body, first);
+        body[length++] = (uint8_t)number;
+    } else if (strcmp(command, "join") == 0 && parse_number(first, &number) &&
+               second == NULL) {
+        type = MSG_JOIN_ROOM_REQ;
+        protocol_put_u32(body, number);
+        length = 4;
+    } else if (strcmp(command, "invite") == 0 && first != NULL &&
+               strlen(first) <= PROTOCOL_MAX_USERNAME &&
+               second == NULL) {
+        type = MSG_INVITE_REQ;
+        length = protocol_put_name(body, first);
+    } else if (strcmp(command, "kick") == 0 && parse_number(first, &number) &&
+               second == NULL) {
+        type = MSG_KICK_REQ;
+        protocol_put_u32(body, number);
+        length = 4;
+    } else if (strcmp(command, "leave") == 0 && first == NULL) {
+        type = MSG_LEAVE_ROOM_REQ;
+    } else if (strcmp(command, "start") == 0 && first == NULL) {
+        if (client->room.id == 0) {
+            puts("Join or create a room first");
+            prompt();
+            return;
+        }
+        if (client->room.self_id != client->room.host_id) {
+            puts("Only the host can start the game");
+            prompt();
+            return;
+        }
+        type = MSG_START_GAME_REQ;
+    } else {
+        print_commands();
+        prompt();
+        return;
+    }
+
+    if (!queue_request(client, type, body, length)) {
+        puts("Could not queue request");
+        prompt();
+    }
 }
 
 static void print_name(const char *name)
@@ -244,6 +413,313 @@ static bool update_room(struct client *client, const uint8_t *body, size_t lengt
     return true;
 }
 
+static int game_player_index(const struct game_view *game, uint32_t player_id)
+{
+    for (size_t i = 0; i < game->player_count; ++i) {
+        if (game->player_ids[i] == player_id) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static const char *room_player_name(const struct client *client,
+                                   uint32_t player_id)
+{
+    for (size_t i = 0; i < client->room.count; ++i) {
+        if (client->room.players[i].id == player_id) {
+            return client->room.players[i].name;
+        }
+    }
+    return NULL;
+}
+
+static void print_player_id(const struct client *client, uint32_t player_id)
+{
+    const char *name = room_player_name(client, player_id);
+    if (name != NULL) {
+        print_name(name);
+    } else {
+        printf("player #%" PRIu32, player_id);
+    }
+}
+
+static void start_game_view(struct client *client)
+{
+    client->game = (struct game_view){.active = true};
+    client->game.player_count = client->room.count;
+    for (size_t i = 0; i < client->room.count; ++i) {
+        client->game.player_ids[i] = client->room.players[i].id;
+        client->game.alive[i] = true;
+    }
+}
+
+static const char *role_name(enum protocol_role role)
+{
+    switch (role) {
+    case PROTOCOL_ROLE_WEREWOLF: return "Werewolf";
+    case PROTOCOL_ROLE_VILLAGER: return "Villager";
+    case PROTOCOL_ROLE_SEER: return "Seer";
+    case PROTOCOL_ROLE_GUARD: return "Guard";
+    }
+    return "Unknown";
+}
+
+static const char *phase_name(enum protocol_phase phase)
+{
+    switch (phase) {
+    case PROTOCOL_PHASE_NIGHT: return "Night";
+    case PROTOCOL_PHASE_DAY_DISCUSS: return "Day discussion";
+    case PROTOCOL_PHASE_DAY_VOTE: return "Day vote";
+    }
+    return "Unknown";
+}
+
+static void print_game_status(const struct client *client)
+{
+    if (!client->game.active) {
+        puts(client->room.id == 0 ? "You are in the lobby" : "You are in a room");
+        return;
+    }
+    if (client->game.over) {
+        puts("Game over; observing room events");
+        return;
+    }
+    printf("Role: %s | Phase: %s | Duration: %u seconds\n",
+           role_name(client->game.role), phase_name(client->game.phase),
+           (unsigned)client->game.duration_sec);
+    fputs("Players alive:", stdout);
+    for (size_t i = 0; i < client->game.player_count; ++i) {
+        if (client->game.alive[i]) {
+            fputs(" ", stdout);
+            print_player_id(client, client->game.player_ids[i]);
+        }
+    }
+    putchar('\n');
+}
+
+static bool game_push_header_valid(const struct message_header *header)
+{
+    return header->request_id == 0 && header->status == ERR_SUCCESS;
+}
+
+static bool game_push_type(uint8_t type)
+{
+    switch (type) {
+    case MSG_ROLE_ASSIGN:
+    case MSG_WOLF_TEAM_INFO:
+    case MSG_PHASE_CHANGE:
+    case MSG_SEER_RESULT:
+    case MSG_WOLF_TARGET_UPDATE:
+    case MSG_NIGHT_RESULT:
+    case MSG_DAY_RESULT:
+    case MSG_GAME_OVER:
+    case MSG_CHAT_NOTIF:
+        return true;
+    }
+    return false;
+}
+
+static bool handle_game_push(struct client *client,
+                             const struct message_header *header)
+{
+    const uint8_t *body = client->input + PROTOCOL_HEADER_SIZE;
+    if (!game_push_header_valid(header)) {
+        return false;
+    }
+
+    switch (header->type) {
+    case MSG_ROLE_ASSIGN:
+        if (header->length != 1 || body[0] < PROTOCOL_ROLE_WEREWOLF ||
+            body[0] > PROTOCOL_ROLE_GUARD || client->room.id == 0) {
+            return false;
+        }
+        if (!client->game.active || client->game.over) {
+            start_game_view(client);
+        }
+        client->game.role = (enum protocol_role)body[0];
+        printf("\nGame started. Your role is %s\n", role_name(client->game.role));
+        return true;
+    case MSG_WOLF_TEAM_INFO: {
+        if (header->length < 1 || client->game.role != PROTOCOL_ROLE_WEREWOLF) {
+            return false;
+        }
+        uint8_t count = body[0];
+        if (count == 0 || count > PROTOCOL_MAX_PLAYERS ||
+            header->length != 1 + (size_t)count * 4) {
+            return false;
+        }
+        uint32_t ids[PROTOCOL_MAX_PLAYERS];
+        bool has_self = false;
+        for (size_t i = 0; i < count; ++i) {
+            ids[i] = protocol_get_u32(body + 1 + i * 4);
+            if (game_player_index(&client->game, ids[i]) < 0) {
+                return false;
+            }
+            for (size_t j = 0; j < i; ++j) {
+                if (ids[i] == ids[j]) {
+                    return false;
+                }
+            }
+            has_self = has_self || ids[i] == client->room.self_id;
+        }
+        if (!has_self) {
+            return false;
+        }
+        client->game.wolf_count = count;
+        memcpy(client->game.wolf_ids, ids, count * sizeof ids[0]);
+        fputs("Wolf team:", stdout);
+        for (size_t i = 0; i < count; ++i) {
+            fputs(" ", stdout);
+            print_player_id(client, ids[i]);
+        }
+        putchar('\n');
+        return true;
+    }
+    case MSG_PHASE_CHANGE: {
+        if (header->length != 11 || body[0] < PROTOCOL_PHASE_NIGHT ||
+            body[0] > PROTOCOL_PHASE_DAY_VOTE) {
+            return false;
+        }
+        uint16_t duration = protocol_get_u16(body + 1);
+        if (duration == 0) {
+            return false;
+        }
+        if (!client->game.active || client->game.over) {
+            start_game_view(client);
+        }
+        client->game.phase = (enum protocol_phase)body[0];
+        client->game.duration_sec = duration;
+        client->game.deadline_ms = protocol_get_u64(body + 3);
+        printf("\nPhase: %s (%u seconds)\n", phase_name(client->game.phase),
+               (unsigned)duration);
+        if (client->game.phase == PROTOCOL_PHASE_NIGHT) {
+            puts("Use act <player_id> if your role has a night action");
+            if (client->game.role == PROTOCOL_ROLE_WEREWOLF) {
+                puts("Wolves may use chat <text> for private night chat");
+            }
+        } else if (client->game.phase == PROTOCOL_PHASE_DAY_DISCUSS) {
+            puts("Living players may use chat <text>");
+        } else {
+            puts("Living players may use vote <player_id|0>");
+        }
+        return true;
+    }
+    case MSG_SEER_RESULT: {
+        if (header->length != 5 || client->game.role != PROTOCOL_ROLE_SEER ||
+            body[4] > 1 || game_player_index(&client->game,
+                                             protocol_get_u32(body)) < 0) {
+            return false;
+        }
+        fputs("Seer result: ", stdout);
+        print_player_id(client, protocol_get_u32(body));
+        puts(body[4] ? " is a werewolf" : " is not a werewolf");
+        return true;
+    }
+    case MSG_WOLF_TARGET_UPDATE: {
+        if (header->length != 8 || client->game.role != PROTOCOL_ROLE_WEREWOLF) {
+            return false;
+        }
+        uint32_t wolf_id = protocol_get_u32(body);
+        uint32_t target_id = protocol_get_u32(body + 4);
+        if (game_player_index(&client->game, wolf_id) < 0 ||
+            game_player_index(&client->game, target_id) < 0) {
+            return false;
+        }
+        fputs("Wolf target: ", stdout);
+        print_player_id(client, wolf_id);
+        fputs(" chose ", stdout);
+        print_player_id(client, target_id);
+        putchar('\n');
+        return true;
+    }
+    case MSG_NIGHT_RESULT:
+    case MSG_DAY_RESULT: {
+        if (header->length != 4) {
+            return false;
+        }
+        uint32_t player_id = protocol_get_u32(body);
+        if (player_id != 0) {
+            int index = game_player_index(&client->game, player_id);
+            if (index < 0 || !client->game.alive[index]) {
+                return false;
+            }
+            client->game.alive[index] = false;
+        }
+        if (header->type == MSG_NIGHT_RESULT) {
+            if (player_id == 0) {
+                puts("Night result: nobody died");
+            } else {
+                fputs("Night result: ", stdout);
+                print_player_id(client, player_id);
+                puts(" died");
+            }
+        } else if (player_id == 0) {
+            puts("Day result: nobody was executed");
+        } else {
+            fputs("Day result: ", stdout);
+            print_player_id(client, player_id);
+            puts(" was executed");
+        }
+        return true;
+    }
+    case MSG_CHAT_NOTIF: {
+        if (header->length < 6 || header->length > 5 + PROTOCOL_MAX_CHAT_BYTES ||
+            body[0] > PROTOCOL_CHAT_WEREWOLF ||
+            memchr(body + 5, '\0', header->length - 5) != NULL) {
+            return false;
+        }
+        uint32_t from_id = protocol_get_u32(body + 1);
+        if (from_id == 0 || game_player_index(&client->game, from_id) < 0 ||
+            (body[0] == PROTOCOL_CHAT_WEREWOLF &&
+             client->game.role != PROTOCOL_ROLE_WEREWOLF)) {
+            return false;
+        }
+        fputs(body[0] == PROTOCOL_CHAT_WEREWOLF ? "[Wolves] " : "[Village] ",
+              stdout);
+        print_player_id(client, from_id);
+        fputs(": ", stdout);
+        char message[PROTOCOL_MAX_CHAT_BYTES + 1];
+        size_t message_length = header->length - 5;
+        memcpy(message, body + 5, message_length);
+        message[message_length] = '\0';
+        print_name(message);
+        putchar('\n');
+        return true;
+    }
+    case MSG_GAME_OVER: {
+        if (header->length < 1 || header->length > 1 + PROTOCOL_MAX_SUMMARY_BYTES ||
+            body[0] > PROTOCOL_FACTION_WEREWOLF ||
+            memchr(body + 1, '\0', header->length - 1) != NULL) {
+            return false;
+        }
+        client->game.active = true;
+        client->game.over = true;
+        client->game.winner = (enum protocol_faction)body[0];
+        client->game.phase = 0;
+        if (body[0] == PROTOCOL_FACTION_VILLAGE) {
+            puts("\nGame over: village wins");
+        } else if (body[0] == PROTOCOL_FACTION_WEREWOLF) {
+            puts("\nGame over: werewolves win");
+        } else {
+            puts("\nGame over: game cancelled");
+        }
+        if (header->length > 1) {
+            char summary[PROTOCOL_MAX_SUMMARY_BYTES + 1];
+            size_t summary_length = header->length - 1;
+            memcpy(summary, body + 1, summary_length);
+            summary[summary_length] = '\0';
+            print_name(summary);
+            putchar('\n');
+        }
+        puts("You can keep watching room events");
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 static void print_request_error(uint8_t status)
 {
     const char *name = "Unknown error";
@@ -293,6 +769,9 @@ static bool handle_message(struct client *client, const struct message_header *h
         client->room = (struct room_view){0};
         puts("\nKicked by host; returned to lobby");
         return true;
+    }
+    if (game_push_type(header->type)) {
+        return handle_game_push(client, header);
     }
     if (client->pending_type == 0 || header->request_id != client->last_request_id) {
         return false;

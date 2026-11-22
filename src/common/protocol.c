@@ -15,6 +15,13 @@ void protocol_put_u32(uint8_t *bytes, uint32_t value)
     memcpy(bytes, &value, sizeof value);
 }
 
+void protocol_put_u64(uint8_t *bytes, uint64_t value)
+{
+    for (size_t i = 0; i < 8; ++i) {
+        bytes[i] = (uint8_t)(value >> (56 - i * 8));
+    }
+}
+
 uint16_t protocol_get_u16(const uint8_t *bytes)
 {
     uint16_t value;
@@ -27,6 +34,15 @@ uint32_t protocol_get_u32(const uint8_t *bytes)
     uint32_t value;
     memcpy(&value, bytes, sizeof value);
     return ntohl(value);
+}
+
+uint64_t protocol_get_u64(const uint8_t *bytes)
+{
+    uint64_t value = 0;
+    for (size_t i = 0; i < 8; ++i) {
+        value = (value << 8) | bytes[i];
+    }
+    return value;
 }
 
 void protocol_encode_header(uint8_t *bytes, const struct message_header *header)

@@ -1,98 +1,64 @@
-# Giao thức và triển khai server phòng chờ
+# Giao thức client–server
 
-Thiết kế tham chiếu ở [ver2](https://docs.google.com/document/d/1o8jz59_vBk5IG-NB3HvIKDmAgUrok2Aztk2Ux5sSsJY/edit?tab=t.s0u7ebxdy021), mục 4–5 về giao thức và mục 8 về xử lý lỗi. Phân công và tiêu chí từng task nằm trong [PLAN.md](PLAN.md).
+**Thiết kế tham chiếu:** [Google Doc, ver2](https://docs.google.com/document/d/1o8jz59_vBk5IG-NB3HvIKDmAgUrok2Aztk2Ux5sSsJY/edit?tab=t.s0u7ebxdy021).
 
-## Luồng xử lý trên server
+## Quy ước chung
 
-- `src/server/main.c` mở socket lắng nghe IPv4. Mặc định là `127.0.0.1:5555`, giới hạn 64 kết nối đồng thời.
-- `src/server/session.c` dồn kênh với các socket nonblocking. `ppoll()` cho phép mở chặn SIGINT/SIGTERM ngay khi bắt đầu chờ. Hai tín hiệu này yêu cầu vòng lặp đóng kết nối rồi thoát. Mỗi phiên giữ số byte đã đọc, vị trí gửi và hạn khung dở riêng. Server chỉ xử lý yêu cầu sau khi đọc đủ header và body, rồi tiếp tục từ vị trí đã gửi nếu `send()` trả về số byte ngắn hơn yêu cầu.
-- Khi `accept()` báo cạn tài nguyên, server đợi 250 ms trước lần nhận mới và tiếp tục phục vụ các phiên hiện có. Log khung lỗi ghi theo khả năng của đích nhận. Với pipe hoặc socket đang đầy, log có thể bị bỏ để vòng lặp vẫn xử lý được kết nối.
-- `src/server/lobby.c` xử lý nghiệp vụ phòng và tạo thông báo `ROOM_UPDATE`. Vòng lặp I/O đánh dấu phiên lỗi rồi dọn socket sau khi duyệt các descriptor sẵn sàng. Nếu nhiều phiên trong cùng phòng đã được đánh dấu, phòng gửi cập nhật sau khi gỡ phiên cuối cùng trong số đó.
+- Mỗi frame gồm header 8 byte và body tối đa 4096 byte.
+- Header: `msg_type:u8`, `length:u16`, `request_id:u32`, `status_code:u8`. Số nhiều byte dùng big-endian; `length` chỉ tính body. Không gửi nguyên struct C.
+- Request có `request_id != 0`, `status_code = 0`. Response giữ nguyên request ID. Server push dùng ID 0, status 0.
+- `Name` là `len:u8` và 1–32 byte tên, không chứa NUL. Phòng nhận 5–12 người, tính cả host.
 
-Cơ sở kỹ thuật trong slide gồm Lec03, slide 13–15 về byte order, Lec04 TCP, slide 14–18 và 28–37 về I/O và framing, Lec06, slide 22–25 về `poll()`, và Lec07, slide 5–9 về nonblocking I/O.
+## Phòng chờ
 
-## Đặc tả giao thức
-
-Header 8 byte, theo thứ tự `msg_type:u8` (offset 0), `length:u16` (1), `request_id:u32` (3), `status_code:u8` (7). `length` chỉ đếm body, tối đa 4096 byte như mã hiện tại. `u8/u16/u32` lần lượt là 1/2/4 byte. Mọi số nhiều byte dùng big-endian. Mã hóa từng trường, không gửi nguyên struct C. Request có status 0. `max_players` từ 5 đến 12, tính cả Host. Phòng chờ có thể có ít hơn 5 thành viên.
-
-`Name` gồm `len:u8` và đúng `len` byte tên, với `1 ≤ len ≤ 32`, giữ nguyên byte và không chứa NUL. `RoomInfo` và `PlayerEntry` dùng bố cục dưới đây.
-
-Mọi yêu cầu từ client, kể cả `LOGIN`, phải có `request_id` khác `0` và không trùng ID của yêu cầu đang chờ trên cùng socket. Phản hồi giữ nguyên `request_id` của yêu cầu gốc. Thông báo đẩy `ROOM_UPDATE`, `INVITE_NOTIF` và `KICK_NOTIF` có `request_id = 0` và `status_code = 0`.
-
-`MSG_LOGIN_REQ (0x01)` gửi tên thô dài 1–32 byte. Phản hồi `MSG_RESPONSE` có body rỗng. Client hiện dùng `request_id = 1` cho LOGIN. Sau khi đăng nhập thành công, server cấp ID phiên. Client tìm ID của mình trong `ROOM_UPDATE` bằng tên đăng nhập, so sánh theo byte và phân biệt hoa thường.
-
-| Nhóm | Chiều và mã | Body theo thứ tự | Phản hồi và hiệu ứng |
+| Type | Hướng | Body | Kết quả chính |
 | --- | --- | --- | --- |
-| LIST | C → S `MSG_ROOM_LIST_REQ (0x02)`, S → C `MSG_ROOM_LIST_RESP (0x03)` | Request rỗng. Thành công: `count:u16` rồi `count` bản ghi `RoomInfo`. Mỗi bản ghi: `room_id:u32`, `room_name:Name`, `player_count:u8`, `max_players:u8` (7 + độ dài tên byte). | Chỉ gửi cho người yêu cầu. Danh sách rỗng có `count=0` và body 2 byte. Khi lỗi, dùng `MSG_RESPONSE`. |
-| CREATE | C → S `MSG_CREATE_ROOM_REQ (0x04)` | `room_name:Name`, `max_players:u8` (2 + độ dài tên byte). | Tạo phòng chờ, thêm người tạo làm Host. Gửi `MSG_RESPONSE` thành công rồi `ROOM_UPDATE` trên socket của Host. |
-| JOIN | C → S `MSG_JOIN_ROOM_REQ (0x05)` | `room_id:u32` (4 byte). | Vào phòng theo ID. Khi thành công, xếp `MSG_RESPONSE` trước `ROOM_UPDATE` trên socket người vào. Gửi cùng snapshot cho mọi thành viên còn kết nối, kể cả người vừa vào. |
-| ROOM_UPDATE | S → thành viên phòng `MSG_ROOM_UPDATE (0x07)` | `room_id:u32`, `host_id:u32`, `player_count:u8`, rồi `player_count` bản ghi `PlayerEntry`. Mỗi bản ghi: `player_id:u32`, `username:Name` (5 + độ dài tên byte). | Snapshot đầy đủ theo thứ tự vào phòng. `host_id` phải trùng ID của một thành viên trong snapshot. Client thay toàn bộ trạng thái phòng bằng snapshot hợp lệ. Không có ACK từ client. |
+| `0x01 LOGIN` | C→S | Tên thô, 1–32 byte | Response rỗng; tên phải chưa được dùng. |
+| `0x02 ROOM_LIST_REQ` | C→S | Rỗng | `0x03 ROOM_LIST_RESP`: `count:u16`, rồi các `RoomInfo`. |
+| `0x04 CREATE_ROOM_REQ` | C→S | `room_name:Name`, `max_players:u8` | Tạo phòng, người tạo làm host. |
+| `0x05 JOIN_ROOM_REQ` | C→S | `room_id:u32` | Vào phòng nếu còn chỗ. |
+| `0x06 LEAVE_ROOM_REQ` | C→S | Rỗng | Rời phòng, kết nối vẫn ở sảnh. |
+| `0x07 ROOM_UPDATE` | S→phòng | `room_id:u32`, `host_id:u32`, `count:u8`, `PlayerEntry[]` | Snapshot đầy đủ thành viên. |
+| `0x10 INVITE_REQ` | C→S | `target_user:Name` | Host mời người đang ở sảnh. |
+| `0x11 INVITE_NOTIF` | S→C | `room_id:u32`, `host_name:Name` | Người nhận có thể JOIN. |
+| `0x12 KICK_REQ` | C→S | `target_user_id:u32` | Chỉ host được loại thành viên khác. |
+| `0x13 KICK_NOTIF` | S→C | `reason:u8` (`0x01`: host loại) | Client về sảnh. |
+| `0x14 START_GAME_REQ` | C→S | Rỗng | Chỉ host bắt đầu ván đủ người. |
 
-### Mời, loại và rời phòng chờ
+`RoomInfo = room_id:u32, room_name:Name, player_count:u8, max_players:u8`.
+`PlayerEntry = player_id:u32, username:Name`.
 
-| Thông điệp | Chiều | Body | Xử lý khi thành công |
-| --- | --- | --- | --- |
-| `MSG_INVITE_REQ (0x10)` | Chủ phòng → S | `target_user:Name` | Gửi `MSG_RESPONSE` cho Chủ phòng. Gửi riêng `MSG_INVITE_NOTIF` cho người được mời đang ở sảnh. |
-| `MSG_INVITE_NOTIF (0x11)` | S → người được mời | `room_id:u32`, `host_name:Name` | Client có thể dùng `room_id` để gửi JOIN. Thành viên và sức chứa chỉ thay đổi khi JOIN thành công. |
-| `MSG_KICK_REQ (0x12)` | Chủ phòng → S | `target_user_id:u32` | Gửi `MSG_RESPONSE` cho Chủ phòng, đưa thành viên đích về sảnh, gửi riêng `MSG_KICK_NOTIF` và đẩy `ROOM_UPDATE` cho các thành viên còn lại. |
-| `MSG_KICK_NOTIF (0x13)` | S → người bị loại | `reason:u8`, giá trị `KICK_REASON_HOST (0x01)` | Client bỏ dữ liệu phòng và hiển thị lý do Chủ phòng loại. Phiên TCP tiếp tục ở sảnh. |
-| `MSG_LEAVE_ROOM_REQ (0x06)` | C → S | Rỗng | Gửi `MSG_RESPONSE` trước khi gỡ người gửi khỏi phòng. Người rời giữ phiên TCP ở sảnh. Thành viên còn lại nhận `ROOM_UPDATE`, người vào sớm nhất nhận quyền Chủ phòng nếu Chủ phòng rời. Phòng rỗng được xóa. |
+## Trong ván
 
-Tên người được mời được so sánh theo byte, phân biệt hoa thường như LOGIN. Chủ phòng chỉ có thể loại thành viên khác trong cùng phòng. Các phòng hiện đều đang chờ.
+Request hành động nhận response rỗng nếu thành công. Server gửi event tới người chơi được phép nhận.
 
-`MSG_RESPONSE (0xFF)` có body rỗng. Thành công dùng `0x00`. Với frame trong giới hạn, server kiểm tra cấu trúc trước, sau đó kiểm tra đăng nhập, quyền và mục tiêu.
+| Type | Hướng | Body |
+| --- | --- | --- |
+| `0x20 ROLE_ASSIGN` | S→C riêng | `role_id:u8`: 1 Sói, 2 Dân, 3 Tiên tri, 4 Bảo vệ |
+| `0x22 WOLF_TEAM_INFO` | S→Sói | `count:u8`, `wolf_ids:u32[]` |
+| `0x30 PHASE_CHANGE` | S→phòng | `phase:u8`, `duration_sec:u16`, `deadline_ms:u64` |
+| `0x31 NIGHT_ACTION_REQ` | C→S | `target_id:u32` |
+| `0x32 SEER_RESULT` | S→Tiên tri | `target_id:u32`, `is_werewolf:u8` |
+| `0x33 WOLF_TARGET_UPDATE` | S→Sói sống | `wolf_id:u32`, `target_id:u32` |
+| `0x34 NIGHT_RESULT` | S→phòng | `killed_id:u32`; 0 là không ai chết |
+| `0x35 DAY_VOTE_REQ` | C→S | `target_id:u32`; 0 là phiếu trắng |
+| `0x36 DAY_RESULT` | S→phòng | `executed_id:u32`; 0 là không ai bị treo |
+| `0x37 CHAT_MSG` | C→S | `scope:u8`, `message:bytes` |
+| `0x38 GAME_OVER` | S→phòng | `winner:u8`, `summary:bytes`; 0 hủy, 1 Dân, 2 Sói |
+| `0x39 CHAT_NOTIF` | S→C | `scope:u8`, `from_id:u32`, `message:bytes` |
 
-| Status | Khi trả |
-| --- | --- |
-| `0x08 ERR_INVALID_PAYLOAD` | Sai loại/chiều thông điệp, status request khác 0, `request_id` bằng 0, body thiếu/thừa byte, tên sai định dạng hoặc sức chứa ngoài 5–12. |
-| `0x01 ERR_UNAUTHENTICATED` | Gửi yêu cầu phòng hợp lệ trước LOGIN. |
-| `0x02 ERR_UNAUTHORIZED` | LIST/CREATE/JOIN khi đã ở trong phòng, LEAVE khi chưa vào phòng, hoặc INVITE/KICK khi phiên gửi không có quyền Chủ phòng. |
-| `0x04 ERR_INVALID_TARGET` | Tên được mời không thuộc một phiên đã đăng nhập đang ở sảnh, hoặc mục tiêu KICK không phải thành viên khác còn kết nối trong cùng phòng. |
-| `0x09 ERR_ROOM_NOT_FOUND` | JOIN từ sảnh với ID không tồn tại. |
-| `0x05 ERR_ROOM_FULL` | JOIN từ sảnh vào phòng đã đủ chỗ. |
-| `0x06 ERR_USERNAME_EXIST` | Tên LOGIN trùng tên của một phiên còn kết nối. Tên dùng lại được sau khi phiên cũ được dọn. |
+Pha: 1 Đêm, 2 Thảo luận, 3 Bỏ phiếu. Scope chat: 0 Làng ban ngày, 1 Sói ban đêm. Chat là 1–512 byte; summary tối đa 256 byte. Text chiếm phần body còn lại, không có NUL hay trường độ dài riêng.
 
-Lệnh thất bại không đổi trạng thái phòng và không phát thông báo đẩy. Với yêu cầu có ID `0`, server trả `MSG_RESPONSE (0xFF)` với ID `0` và status `0x08` mà không thực hiện lệnh. Client phân biệt phản hồi lỗi với `ROOM_UPDATE` bằng `msg_type`. Server đóng riêng kết nối nếu `length > 4096` hoặc khung dở quá 10 giây. Sau 5 frame lỗi liên tiếp, gửi phản hồi lỗi cuối rồi đóng. Các mã lỗi nghiệp vụ không tính là frame lỗi.
+Người chết không chat/vote; vẫn nhận chat làng để theo dõi. Chat Sói chỉ trao đổi giữa Sói sống ban đêm. Phiếu hợp lệ đầu tiên được giữ, không đổi phiếu. Chốt sớm khi mọi người chơi sống và kết nối đã vote; hết 30 giây thì phiếu chưa gửi tính trắng. Hòa hoặc toàn phiếu trắng: không ai bị treo.
 
-### API dùng chung cho client và server
+## Lỗi và mã dùng chung
 
-Hai chương trình cùng include [protocol.h](../include/protocol.h) và dịch với [protocol.c](../src/common/protocol.c). Dùng `PROTOCOL_MAX_FRAME` cho bộ đệm chứa một khung tối đa, gồm 8 byte header và 4096 byte body.
+Response lỗi dùng `MSG_RESPONSE (0xFF)`, body rỗng. Các mã chính: `0x01` chưa đăng nhập, `0x02` không đủ quyền, `0x04` mục tiêu sai, `0x05` phòng đầy, `0x06` tên trùng, `0x08` payload sai, `0x09` không tìm thấy phòng. Logic game dùng thêm `ERR_WRONG_PHASE`, `ERR_NOT_ENOUGH_PLAYERS`, `ERR_INTERNAL` trong `protocol.h`.
 
-- `protocol_encode_header()` và `protocol_decode_header()` đọc hoặc ghi đúng `PROTOCOL_HEADER_SIZE` byte. Bên nhận gom đủ header rồi mới giải mã và kiểm tra độ dài, loại thông điệp cùng các trường liên quan trước khi xử lý body.
-- `protocol_put_u16()`, `protocol_put_u32()` và hai hàm đọc tương ứng chuyển đổi số nguyên theo thứ tự byte mạng. Bên gọi bảo đảm bộ đệm còn đủ 2 hoặc 4 byte.
-- `protocol_put_name()` ghi trường `Name` đã được kiểm tra độ dài và trả số byte đã ghi. `protocol_get_name()` kiểm tra trường theo độ dài body, thêm NUL vào bộ đệm đích và cập nhật offset khi thành công. LOGIN gửi tên thô theo độ dài header.
+Client và server cùng dùng [`protocol.h`](../include/protocol.h) và [`protocol.c`](../src/common/protocol.c) để mã hóa header, số nguyên và tên.
 
-### Gói mẫu trên đường truyền
+## Cần làm rõ
 
-| Frame | Hex |
-| --- | --- |
-| LOGIN của `alice`, ID yêu cầu 1 | `01 00 05 00 00 00 01 00 61 6C 69 63 65` |
-| Phản hồi LOGIN thành công, cùng ID | `FF 00 00 00 00 00 01 00` |
-| LIST yêu cầu, ID 2 | `02 00 00 00 00 00 02 00` |
-| LIST thành công với danh sách rỗng, cùng ID | `03 00 02 00 00 00 02 00 00 00` |
-
-Phòng 7 có Host 101 (`alice`) và thành viên 102 (`bob`). `ROOM_UPDATE` có 27 byte body và 35 byte cả frame:
-
-```text
-07 00 1B 00 00 00 00 00
-00 00 00 07  00 00 00 65  02
-00 00 00 65  05 61 6C 69 63 65
-00 00 00 66  03 62 6F 62
-```
-
-`test_protocol_samples()` trong [tests/lobby.py](../tests/lobby.py) chuyển tiếp gói thật giữa client và server qua loopback. Ca kiểm thử so từng byte của LOGIN và LIST trên cùng kết nối để phát hiện byte dư sau LOGIN ở cả hai chiều.
-
-## Chạy kiểm thử
-
-Từ gốc repository trên Linux, dừng server demo nếu đang chạy rồi thực hiện:
-
-```sh
-make -B CFLAGS='-std=c11 -Wall -Wextra -Werror'
-python3 -B tests/lobby.py
-```
-
-Bộ test tự mở server và hai client thật để kiểm tra đăng nhập đồng thời, luồng phòng chờ, cập nhật Chủ phòng khi EOF và dùng lại tên. Các socket thử giao thức kiểm tra khung gửi từng byte, 100 khung gửi liền, ghép phản hồi theo ID, tên trùng, header và body sai, ngưỡng năm khung lỗi, timeout header/body dở và reset kết nối. Sau khi các client thoát, số descriptor của server phải trở về mức ban đầu.
-
-Các ca hồi quy kiểm tra pipe log đầy, cạn và khôi phục descriptor, dừng server bằng SIGINT/SIGTERM, từ chối JOIN phòng đầy và hiện tên chứa ký tự điều khiển dưới dạng escape. Tên trên giao thức vẫn được truyền theo byte gốc. `test_room_administration()` kiểm tra gói mời và loại, quyền Chủ phòng, mục tiêu và body sai, giữ phiên sau KICK/LEAVE, chuyển Chủ phòng và xóa phòng rỗng. `test_simultaneous_disconnects()` kiểm tra phòng chỉ gửi một bản cập nhật với Chủ phòng còn kết nối khi hai thành viên đầu tiên cùng ngắt kết nối.
-
-Nguồn kiểm thử nằm trong [tests/lobby.py](../tests/lobby.py). Cách demo bằng tay có trong [README](../README.md).
+- Host rời ván (chuyển host? hủy ván?)
+- Mất kết nối giữa ván (vote và điều kiện thắng)
+- Chốt giới hạn byte chat/summary và charset hiển thị
