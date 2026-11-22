@@ -11,6 +11,8 @@ enum {
     PROTOCOL_MAX_FRAME = PROTOCOL_HEADER_SIZE + PROTOCOL_MAX_BODY,
     PROTOCOL_MAX_NAME = 32,
     PROTOCOL_MAX_USERNAME = PROTOCOL_MAX_NAME,
+    PROTOCOL_MAX_CHAT_BYTES = 512,
+    PROTOCOL_MAX_SUMMARY_BYTES = 256,
     PROTOCOL_MIN_PLAYERS = 5,
     PROTOCOL_MAX_PLAYERS = 12
 };
@@ -28,7 +30,43 @@ enum {
     MSG_KICK_REQ = 0x12,
     MSG_KICK_NOTIF = 0x13,
     MSG_START_GAME_REQ = 0x14,
+    MSG_ROLE_ASSIGN = 0x20,
+    MSG_WOLF_TEAM_INFO = 0x22,
+    MSG_PHASE_CHANGE = 0x30,
+    MSG_NIGHT_ACTION_REQ = 0x31,
+    MSG_SEER_RESULT = 0x32,
+    MSG_WOLF_TARGET_UPDATE = 0x33,
+    MSG_NIGHT_RESULT = 0x34,
+    MSG_DAY_VOTE_REQ = 0x35,
+    MSG_DAY_RESULT = 0x36,
+    MSG_CHAT_MSG = 0x37,
+    MSG_GAME_OVER = 0x38,
+    MSG_CHAT_NOTIF = 0x39,
     MSG_RESPONSE = 0xFF
+};
+
+enum protocol_role {
+    PROTOCOL_ROLE_WEREWOLF = 1,
+    PROTOCOL_ROLE_VILLAGER = 2,
+    PROTOCOL_ROLE_SEER = 3,
+    PROTOCOL_ROLE_GUARD = 4
+};
+
+enum protocol_phase {
+    PROTOCOL_PHASE_NIGHT = 1,
+    PROTOCOL_PHASE_DAY_DISCUSS = 2,
+    PROTOCOL_PHASE_DAY_VOTE = 3
+};
+
+enum protocol_faction {
+    PROTOCOL_FACTION_NONE = 0,
+    PROTOCOL_FACTION_VILLAGE = 1,
+    PROTOCOL_FACTION_WEREWOLF = 2
+};
+
+enum protocol_chat_scope {
+    PROTOCOL_CHAT_VILLAGE = 0,
+    PROTOCOL_CHAT_WEREWOLF = 1
 };
 
 enum {
@@ -66,8 +104,10 @@ void protocol_decode_header(struct message_header *header, const uint8_t *bytes)
 // Bên gọi bảo đảm vùng đọc hoặc ghi có đủ 2 hay 4 byte tương ứng.
 void protocol_put_u16(uint8_t *bytes, uint16_t value);
 void protocol_put_u32(uint8_t *bytes, uint32_t value);
+void protocol_put_u64(uint8_t *bytes, uint64_t value);
 uint16_t protocol_get_u16(const uint8_t *bytes);
 uint32_t protocol_get_u32(const uint8_t *bytes);
+uint64_t protocol_get_u64(const uint8_t *bytes);
 
 // name dài 1–PROTOCOL_MAX_NAME byte. bytes cần đủ 1 + strlen(name) byte.
 size_t protocol_put_name(uint8_t *bytes, const char *name);

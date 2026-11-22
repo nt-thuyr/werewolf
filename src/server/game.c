@@ -1,6 +1,7 @@
 #include "server/game.h"
 
 #include <limits.h>
+#include <string.h>
 
 static uint8_t wolf_count_for(size_t player_count)
 {
@@ -264,6 +265,277 @@ static bool append_day_discuss_event(const struct game *game,
     event->data.phase_change.duration_sec = GAME_DAY_DISCUSS_DURATION_SEC;
     event->data.phase_change.deadline_ms = game->deadline_ms;
     return true;
+}
+
+static bool append_phase_event(const struct game *game,
+                              struct game_event_batch *events)
+{
+    struct game_event *event;
+    if (!append_event(events, GAME_EVENT_PHASE_CHANGE, &event))
+    {
+        return false;
+    }
+    add_connected_recipients(game, event);
+    event->data.phase_change.phase = game->phase;
+    event->data.phase_change.duration_sec = GAME_NIGHT_DURATION_SEC;
+    event->data.phase_change.deadline_ms = game->deadline_ms;
+    return true;
+}
+
+static bool all_day_votes_submitted(const struct game *game)
+{
+    for (size_t i = 0; i < game->player_count; ++i)
+    {
+        const struct game_player *player = &game->players[i];
+        if (player->alive && player->connected && !player->vote_submitted)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+static enum game_result settle_day_vote(struct game *game, uint64_t now_ms,
+                                        struct game_event_batch *events)
+{
+    uint8_t counts[PROTOCOL_MAX_PLAYERS] = {0};
+    for (size_t i = 0; i < game->player_count; ++i)
+    {
+        const struct game_player *voter = &game->players[i];
+        if (!voter->alive || !voter->connected || !voter->vote_submitted ||
+            voter->vote_target_id == 0)
+        {
+            continue;
+        }
+        const struct game_player *target =
+            game_find_player(game, voter->vote_target_id);
+        if (target == NULL || !target->alive || !target->connected)
+        {
+            continue;
+        }
+        size_t target_index = (size_t)(target - game->players);
+        ++counts[target_index];
+    }
+
+    uint8_t highest = 0;
+    size_t chosen_index = PROTOCOL_MAX_PLAYERS;
+    bool tied = false;
+    for (size_t i = 0; i < game->player_count; ++i)
+    {
+        if (counts[i] > highest)
+        {
+            highest = counts[i];
+            chosen_index = i;
+            tied = false;
+        }
+        else if (counts[i] != 0 && counts[i] == highest)
+        {
+            tied = true;
+        }
+    }
+
+    uint32_t executed_id = 0;
+    if (highest != 0 && !tied)
+    {
+        executed_id = game->players[chosen_index].id;
+    }
+
+    struct game next_game = *game;
+    struct game_event_batch next_events = *events;
+    if (executed_id != 0)
+    {
+        struct game_player *executed =
+            find_player_mutable(&next_game, executed_id);
+        executed->alive = false;
+    }
+
+    struct game_event *event;
+    if (!append_event(&next_events, GAME_EVENT_DAY_RESULT, &event))
+    {
+        return GAME_RESULT_INTERNAL;
+    }
+    add_connected_recipients(&next_game, event);
+    event->data.day_result.executed_player_id = executed_id;
+
+    enum game_result winner_result =
+        game_check_winner(&next_game, &next_events);
+    if (winner_result != GAME_RESULT_OK)
+    {
+        return winner_result;
+    }
+    if (!game_is_over(&next_game))
+    {
+        const uint64_t duration_ms =
+            (uint64_t)GAME_NIGHT_DURATION_SEC * UINT64_C(1000);
+        if (now_ms > UINT64_MAX - duration_ms ||
+            next_game.round_number == UINT32_MAX)
+        {
+            return GAME_RESULT_INTERNAL;
+        }
+        reset_round_data(&next_game);
+        ++next_game.round_number;
+        next_game.phase = GAME_PHASE_NIGHT;
+        next_game.phase_started_ms = now_ms;
+        next_game.deadline_ms = now_ms + duration_ms;
+        if (!append_phase_event(&next_game, &next_events))
+        {
+            return GAME_RESULT_INTERNAL;
+        }
+    }
+
+    *game = next_game;
+    *events = next_events;
+    return GAME_RESULT_OK;
+}
+
+static enum game_result open_day_vote(struct game *game, uint64_t now_ms,
+                                      struct game_event_batch *events)
+{
+    const uint64_t duration_ms =
+        (uint64_t)GAME_DAY_VOTE_DURATION_SEC * UINT64_C(1000);
+    if (now_ms > UINT64_MAX - duration_ms)
+    {
+        return GAME_RESULT_INTERNAL;
+    }
+
+    struct game next_game = *game;
+    struct game_event_batch next_events = *events;
+    reset_round_data(&next_game);
+    next_game.phase = GAME_PHASE_DAY_VOTE;
+    next_game.phase_started_ms = now_ms;
+    next_game.deadline_ms = now_ms + duration_ms;
+
+    struct game_event *event;
+    if (!append_event(&next_events, GAME_EVENT_PHASE_CHANGE, &event))
+    {
+        return GAME_RESULT_INTERNAL;
+    }
+    add_connected_recipients(&next_game, event);
+    event->data.phase_change.phase = GAME_PHASE_DAY_VOTE;
+    event->data.phase_change.duration_sec = GAME_DAY_VOTE_DURATION_SEC;
+    event->data.phase_change.deadline_ms = next_game.deadline_ms;
+
+    *game = next_game;
+    *events = next_events;
+    return GAME_RESULT_OK;
+}
+
+static enum game_result handle_chat(struct game *game, uint32_t player_id,
+                                    const struct game_command *command,
+                                    struct game_event_batch *events)
+{
+    struct game_player *actor = find_player_mutable(game, player_id);
+    if (actor == NULL || !actor->alive || !actor->connected)
+    {
+        return GAME_RESULT_UNAUTHORIZED;
+    }
+    if (command->data.chat.message == NULL ||
+        command->data.chat.message_length == 0 ||
+        command->data.chat.message_length > GAME_MAX_CHAT_BYTES ||
+        memchr(command->data.chat.message, '\0',
+               command->data.chat.message_length) != NULL)
+    {
+        return GAME_RESULT_INVALID_PAYLOAD;
+    }
+
+    bool wolf_chat =
+        command->data.chat.scope == GAME_CHAT_WEREWOLF &&
+        game->phase == GAME_PHASE_NIGHT &&
+        actor->role == GAME_ROLE_WEREWOLF;
+    bool village_chat =
+        command->data.chat.scope == GAME_CHAT_VILLAGE &&
+        game->phase == GAME_PHASE_DAY_DISCUSS;
+    unsigned scope = (unsigned)command->data.chat.scope;
+    if (scope > GAME_CHAT_WEREWOLF)
+    {
+        return GAME_RESULT_INVALID_PAYLOAD;
+    }
+    if (!wolf_chat && !village_chat)
+    {
+        return command->data.chat.scope == GAME_CHAT_WEREWOLF &&
+                       actor->role != GAME_ROLE_WEREWOLF
+            ? GAME_RESULT_UNAUTHORIZED
+            : GAME_RESULT_WRONG_PHASE;
+    }
+
+    struct game_event *event;
+    if (!append_event(events, GAME_EVENT_CHAT, &event))
+    {
+        return GAME_RESULT_INTERNAL;
+    }
+    if (wolf_chat)
+    {
+        for (size_t i = 0; i < game->player_count; ++i)
+        {
+            const struct game_player *wolf = &game->players[i];
+            if (wolf->alive && wolf->connected &&
+                wolf->role == GAME_ROLE_WEREWOLF)
+            {
+                event->recipient_ids[event->recipient_count++] = wolf->id;
+            }
+        }
+    }
+    else
+    {
+        // Người chết chỉ nhận chat làng để theo dõi, không được gửi.
+        add_connected_recipients(game, event);
+    }
+    event->data.chat.scope = command->data.chat.scope;
+    event->data.chat.from_player_id = actor->id;
+    event->data.chat.message_length =
+        (uint16_t)command->data.chat.message_length;
+    memcpy(event->data.chat.message, command->data.chat.message,
+           command->data.chat.message_length);
+    return GAME_RESULT_OK;
+}
+
+static enum game_result handle_day_vote(struct game *game, uint32_t player_id,
+                                        const struct game_command *command,
+                                        uint64_t now_ms,
+                                        struct game_event_batch *events)
+{
+    if (game->phase != GAME_PHASE_DAY_VOTE)
+    {
+        return GAME_RESULT_WRONG_PHASE;
+    }
+    struct game_player *actor = find_player_mutable(game, player_id);
+    if (actor == NULL || !actor->alive || !actor->connected ||
+        actor->vote_submitted)
+    {
+        return GAME_RESULT_UNAUTHORIZED;
+    }
+
+    uint32_t target_id = command->data.day_vote.target_player_id;
+    if (target_id != 0)
+    {
+        struct game_player *target = find_player_mutable(game, target_id);
+        if (target == NULL || !target->alive || !target->connected ||
+            target->id == actor->id)
+        {
+            return GAME_RESULT_INVALID_TARGET;
+        }
+    }
+
+    struct game next_game = *game;
+    struct game_event_batch next_events = *events;
+    struct game_player *next_actor =
+        find_player_mutable(&next_game, player_id);
+    next_actor->vote_submitted = true;
+    next_actor->vote_target_id = target_id;
+
+    if (all_day_votes_submitted(&next_game))
+    {
+        enum game_result settle_result =
+            settle_day_vote(&next_game, now_ms, &next_events);
+        if (settle_result != GAME_RESULT_OK)
+        {
+            return settle_result;
+        }
+    }
+
+    *game = next_game;
+    *events = next_events;
+    return GAME_RESULT_OK;
 }
 
 static enum game_faction detect_winner(const struct game *game)
@@ -589,8 +861,25 @@ enum game_result game_handle_command(struct game *game, uint32_t player_id,
     if (command->type == GAME_COMMAND_CHAT ||
         command->type == GAME_COMMAND_DAY_VOTE)
     {
-        /* SERVER-09 chưa triển khai trong mô-đun này. */
-        return GAME_RESULT_INTERNAL;
+        if (game_is_over(game))
+        {
+            return GAME_RESULT_WRONG_PHASE;
+        }
+        if (now_ms >= game->deadline_ms)
+        {
+            enum game_result timeout_result =
+                game_handle_timeout(game, now_ms, events);
+            if (timeout_result != GAME_RESULT_OK)
+            {
+                return timeout_result;
+            }
+            return GAME_RESULT_WRONG_PHASE;
+        }
+        if (command->type == GAME_COMMAND_CHAT)
+        {
+            return handle_chat(game, player_id, command, events);
+        }
+        return handle_day_vote(game, player_id, command, now_ms, events);
     }
     if (command->type != GAME_COMMAND_NIGHT_ACTION)
     {
@@ -714,12 +1003,19 @@ enum game_result game_handle_timeout(struct game *game, uint64_t now_ms,
     {
         return GAME_RESULT_OK;
     }
-    if (game->phase != GAME_PHASE_NIGHT)
+    if (game->phase == GAME_PHASE_DAY_DISCUSS)
     {
-        /* Timeout pha ngày thuộc SERVER-09. */
-        return GAME_RESULT_INTERNAL;
+        return open_day_vote(game, now_ms, events);
     }
-    return settle_night(game, now_ms, events);
+    if (game->phase == GAME_PHASE_DAY_VOTE)
+    {
+        return settle_day_vote(game, now_ms, events);
+    }
+    if (game->phase == GAME_PHASE_NIGHT)
+    {
+        return settle_night(game, now_ms, events);
+    }
+    return GAME_RESULT_WRONG_PHASE;
 }
 
 enum game_result game_handle_player_left(struct game *game,

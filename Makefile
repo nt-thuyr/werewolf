@@ -7,6 +7,7 @@ COMMON_HEADERS := include/net_config.h include/protocol.h
 GAME_TEST := $(BUILD_DIR)/test_game
 GAME_NIGHT_TEST := $(BUILD_DIR)/test_game_night
 GAME_WIN_TEST := $(BUILD_DIR)/test_game_win
+GAME_DAY_TEST := $(BUILD_DIR)/test_game_day
 
 .PHONY: all clean test-game
 
@@ -27,13 +28,17 @@ $(GAME_NIGHT_TEST): tests/game_night.c src/server/game.c include/server/game.h i
 $(GAME_WIN_TEST): tests/game_win.c src/server/game.c include/server/game.h include/protocol.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
-test-game: $(GAME_TEST) $(GAME_NIGHT_TEST) $(GAME_WIN_TEST)
+$(GAME_DAY_TEST): tests/game_day.c src/server/game.c include/server/game.h include/protocol.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+test-game: $(GAME_TEST) $(GAME_NIGHT_TEST) $(GAME_WIN_TEST) $(GAME_DAY_TEST)
 	./$(GAME_TEST)
 	./$(GAME_NIGHT_TEST)
 	./$(GAME_WIN_TEST)
+	./$(GAME_DAY_TEST)
 
 $(BUILD_DIR):
 	mkdir -p $@
 
 clean:
-	$(RM) $(BUILD_DIR)/server $(BUILD_DIR)/client $(GAME_TEST) $(GAME_NIGHT_TEST) $(GAME_WIN_TEST)
+	$(RM) $(BUILD_DIR)/server $(BUILD_DIR)/client $(GAME_TEST) $(GAME_NIGHT_TEST) $(GAME_WIN_TEST) $(GAME_DAY_TEST)
