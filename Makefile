@@ -13,7 +13,7 @@ GAME_DAY_TEST := $(BUILD_DIR)/test_game_day
 
 all: $(BUILD_DIR)/server $(BUILD_DIR)/client
 
-$(BUILD_DIR)/server: src/server/main.c src/server/session.c include/server/session.h src/server/lobby.c include/server/lobby.h $(COMMON_SOURCE) $(COMMON_HEADERS) | $(BUILD_DIR)
+$(BUILD_DIR)/server: src/server/main.c src/server/session.c include/server/session.h src/server/lobby.c include/server/lobby.h src/server/game.c include/server/game.h $(COMMON_SOURCE) $(COMMON_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
 
 $(BUILD_DIR)/client: src/client/main.c src/client/lobby.c include/client/lobby.h $(COMMON_SOURCE) $(COMMON_HEADERS) | $(BUILD_DIR)

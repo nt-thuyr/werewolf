@@ -49,7 +49,6 @@ def test_administration():
         wait_output(bob, b"Rooms: 0")
         command(bob, "leave")
         wait_output(bob, b"ERR_UNAUTHORIZED (0x02)")
-        # SERVER-05 is absent: report the error without disconnecting or starting locally.
         command(bob, "start")
         wait_output(bob, b"Join or create a room first")
         command(bob, "list")

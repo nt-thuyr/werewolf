@@ -101,7 +101,7 @@ struct message_header {
 void protocol_encode_header(uint8_t *bytes, const struct message_header *header);
 void protocol_decode_header(struct message_header *header, const uint8_t *bytes);
 
-// Bên gọi bảo đảm vùng đọc hoặc ghi có đủ 2 hay 4 byte tương ứng.
+// Bên gọi bảo đảm vùng đọc hoặc ghi có đủ 2, 4 hoặc 8 byte tương ứng.
 void protocol_put_u16(uint8_t *bytes, uint16_t value);
 void protocol_put_u32(uint8_t *bytes, uint32_t value);
 void protocol_put_u64(uint8_t *bytes, uint64_t value);

@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -103,26 +104,46 @@ void session_queue_message(struct session *session, struct message_header header
     session->queued += frame_size;
 }
 
-static void close_session(struct pollfd *slot, struct session *session)
+static void close_session(struct pollfd *slot, struct session *session, uint64_t now_ms)
 {
     close(slot->fd);
     slot->fd = -1;
-    lobby_remove_session(session);
+    lobby_remove_session(session, now_ms);
     *session = (struct session){0};
 }
 
-static void close_failed_sessions(struct pollfd *slots, struct lobby *lobby)
+static void close_failed_sessions(struct pollfd *slots, struct lobby *lobby, uint64_t now_ms)
 {
     bool closed;
     do {
         closed = false;
         for (size_t i = 0; i < MAX_SESSIONS; ++i) {
             if (lobby->sessions[i].closing) {
-                close_session(&slots[i + 1], &lobby->sessions[i]);
+                close_session(&slots[i + 1], &lobby->sessions[i], now_ms);
                 closed = true;
             }
         }
     } while (closed);
+}
+
+static void mark_disconnected_sessions(const struct pollfd *slots, nfds_t count,
+                                       struct lobby *lobby)
+{
+    for (size_t i = 1; i < count; ++i) {
+        const struct pollfd *slot = &slots[i];
+        struct session *session = &lobby->sessions[i - 1];
+        if (slot->fd == -1 || session->closing) {
+            continue;
+        }
+        if (slot->revents & (POLLERR | POLLNVAL)) {
+            session->closing = true;
+        } else if (slot->revents & POLLRDHUP) {
+            uint8_t byte;
+            if (recv(slot->fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0) {
+                session->closing = true;
+            }
+        }
+    }
 }
 
 static uint8_t login(struct lobby *lobby, struct session *session,
@@ -154,7 +175,8 @@ static uint8_t login(struct lobby *lobby, struct session *session,
 
 static uint8_t handle_request(struct lobby *lobby, struct session *session,
                               const struct message_header *header,
-                              struct session **target)
+                              uint64_t now_ms, struct session **target,
+                              struct game_event_batch *events)
 {
     const uint8_t *body = session->input + PROTOCOL_HEADER_SIZE;
     if (header->status != 0 || header->request_id == 0) {
@@ -164,7 +186,7 @@ static uint8_t handle_request(struct lobby *lobby, struct session *session,
         return login(lobby, session, body, header->length);
     }
 
-    return lobby_handle_request(lobby, session, header, target);
+    return lobby_handle_request(lobby, session, header, now_ms, target, events);
 }
 
 static bool read_request(int fd, struct lobby *lobby, struct session *session,
@@ -206,7 +228,9 @@ static bool read_request(int fd, struct lobby *lobby, struct session *session,
 
     // Chỉ xử lý yêu cầu khi đã nhận đủ một khung.
     struct session *target = NULL;
-    uint8_t status = handle_request(lobby, session, &header, &target);
+    struct game_event_batch events = {0};
+    uint8_t status = handle_request(lobby, session, &header, (uint64_t)now,
+                                    &target, &events);
     if (status == ERR_INVALID_PAYLOAD) {
         ++session->invalid_frames;
     } else {
@@ -224,7 +248,10 @@ static bool read_request(int fd, struct lobby *lobby, struct session *session,
         };
         session_queue_message(session, reply, NULL);
         if (status == ERR_SUCCESS) {
-            lobby_finish_request(session, header.type, target);
+            lobby_finish_request(session, header.type, (uint64_t)now, target);
+        }
+        if (events.count != 0) {
+            lobby_send_game_events(session->room, &events);
         }
     }
     session->received = 0;
@@ -345,7 +372,7 @@ int serve_sessions(int listener, const char *bind_ip)
             }
             count = i + 1;
             struct session *session = &lobby.sessions[i - 1];
-            slots[i].events = session->queued != 0 ? POLLOUT : POLLIN;
+            slots[i].events = session->queued != 0 ? POLLOUT : POLLIN | POLLRDHUP;
             if (session->deadline_ms != 0) {
                 int64_t remaining = session->deadline_ms - now;
                 if (remaining <= 0) {
@@ -356,6 +383,15 @@ int serve_sessions(int listener, const char *bind_ip)
             }
         }
 
+        uint64_t game_deadline = lobby_next_game_deadline(&lobby);
+        if (game_deadline != UINT64_MAX) {
+            uint64_t remaining = game_deadline > (uint64_t)now
+                ? game_deadline - (uint64_t)now : 0;
+            int game_timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
+            if (timeout < 0 || game_timeout < timeout) {
+                timeout = game_timeout;
+            }
+        }
         struct timespec wait_time = {
             .tv_sec = timeout < 0 ? 0 : timeout / 1000,
             .tv_nsec = timeout < 0 ? 0 : (timeout % 1000) * 1000000L
@@ -377,11 +413,15 @@ int serve_sessions(int listener, const char *bind_ip)
             perror("clock_gettime");
             break;
         }
+        // Dọn EOF đã sẵn sàng trước khi START lấy danh sách người còn kết nối.
+        mark_disconnected_sessions(slots, count, &lobby);
+        close_failed_sessions(slots, &lobby, (uint64_t)now);
         for (size_t i = 1; i < count; ++i) {
             service_session(&slots[i], &lobby, &lobby.sessions[i - 1], now, log_fd);
         }
         // Dọn phiên lỗi và cập nhật phòng trước khi nhận kết nối mới.
-        close_failed_sessions(slots, &lobby);
+        close_failed_sessions(slots, &lobby, (uint64_t)now);
+        lobby_handle_game_timeouts(&lobby, (uint64_t)now);
         if (slots[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             fputs("Listening socket failed\n", stderr);
             break;

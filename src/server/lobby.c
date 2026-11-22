@@ -1,6 +1,7 @@
 #include "server/lobby.h"
 
 #include <string.h>
+#include <sys/random.h>
 
 // Thành viên đầu tiên luôn là Chủ phòng.
 static void broadcast_room(const struct room *room)
@@ -30,7 +31,7 @@ static void broadcast_room(const struct room *room)
 }
 
 // Dọn phòng rỗng hoặc thông báo danh sách thành viên còn lại.
-void lobby_remove_session(struct session *session)
+void lobby_remove_session(struct session *session, uint64_t now_ms)
 {
     struct room *room = session->room;
     if (room == NULL) {
@@ -47,10 +48,19 @@ void lobby_remove_session(struct session *session)
             break;
         }
     }
+    if (room->count != 0) {
+        broadcast_room(room);
+    }
+
+    if (room->game.initialized && game_find_player(&room->game, session->id) != NULL) {
+        struct game_event_batch events = {0};
+        if (game_handle_player_left(&room->game, session->id, now_ms, &events) ==
+            GAME_RESULT_OK && room->count != 0) {
+            lobby_send_game_events(room, &events);
+        }
+    }
     if (room->count == 0) {
         *room = (struct room){0};
-    } else {
-        broadcast_room(room);
     }
 }
 
@@ -110,6 +120,9 @@ static uint8_t join_room(struct lobby *lobby, struct session *session,
         if (room->id != room_id) {
             continue;
         }
+        if (room->game.initialized) {
+            return ERR_GAME_RUNNING;
+        }
         if (room->count == room->capacity) {
             return ERR_ROOM_FULL;
         }
@@ -146,17 +159,48 @@ static struct session *find_kick_target(const struct room *room, uint32_t id)
     return NULL;
 }
 
+static uint8_t start_game(struct room *room, uint64_t now_ms,
+                          struct game_event_batch *events)
+{
+    uint32_t player_ids[PROTOCOL_MAX_PLAYERS];
+    size_t count = 0;
+    for (size_t i = 0; i < room->count; ++i) {
+        const struct session *member = room->members[i];
+        if (!member->closing && !member->close_after_reply) {
+            player_ids[count++] = member->id;
+        }
+    }
+    if (count < PROTOCOL_MIN_PLAYERS) {
+        return ERR_NOT_ENOUGH_PLAYERS;
+    }
+
+    uint64_t seed;
+    if (getrandom(&seed, sizeof seed, GRND_NONBLOCK) != sizeof seed) {
+        return ERR_INTERNAL;
+    }
+    struct game_start_input input = {
+        .player_ids = player_ids,
+        .player_count = count,
+        .now_ms = now_ms,
+        .random_seed = seed == 0 ? 1 : seed
+    };
+    return game_init(&room->game, &input, events);
+}
+
 uint8_t lobby_handle_request(struct lobby *lobby, struct session *session,
                              const struct message_header *header,
-                             struct session **target)
+                             uint64_t now_ms, struct session **target,
+                             struct game_event_batch *events)
 {
     const uint8_t *body = session->input + PROTOCOL_HEADER_SIZE;
     char name[PROTOCOL_MAX_NAME + 1];
     size_t offset = 0;
     uint8_t capacity = 0;
+    struct game_command command = {0};
     switch (header->type) {
     case MSG_ROOM_LIST_REQ:
     case MSG_LEAVE_ROOM_REQ:
+    case MSG_START_GAME_REQ:
         if (header->length != 0) {
             return ERR_INVALID_PAYLOAD;
         }
@@ -177,6 +221,30 @@ uint8_t lobby_handle_request(struct lobby *lobby, struct session *session,
             return ERR_INVALID_PAYLOAD;
         }
         break;
+    case MSG_NIGHT_ACTION_REQ:
+    case MSG_DAY_VOTE_REQ:
+        if (header->length != 4) {
+            return ERR_INVALID_PAYLOAD;
+        }
+        if (header->type == MSG_NIGHT_ACTION_REQ) {
+            command.type = GAME_COMMAND_NIGHT_ACTION;
+            command.data.night_action.target_player_id = protocol_get_u32(body);
+        } else {
+            command.type = GAME_COMMAND_DAY_VOTE;
+            command.data.day_vote.target_player_id = protocol_get_u32(body);
+        }
+        break;
+    case MSG_CHAT_MSG:
+        if (header->length < 2 || header->length > 1 + GAME_MAX_CHAT_BYTES ||
+            body[0] > GAME_CHAT_WEREWOLF ||
+            memchr(body + 1, '\0', header->length - 1) != NULL) {
+            return ERR_INVALID_PAYLOAD;
+        }
+        command.type = GAME_COMMAND_CHAT;
+        command.data.chat.scope = body[0];
+        command.data.chat.message = body + 1;
+        command.data.chat.message_length = header->length - 1;
+        break;
     case MSG_INVITE_REQ:
         if (!protocol_get_name(body, header->length, &offset, name) ||
             offset != header->length) {
@@ -194,16 +262,33 @@ uint8_t lobby_handle_request(struct lobby *lobby, struct session *session,
     if (header->type == MSG_LEAVE_ROOM_REQ) {
         return session->room == NULL ? ERR_UNAUTHORIZED : ERR_SUCCESS;
     }
-    if (header->type == MSG_INVITE_REQ || header->type == MSG_KICK_REQ) {
-        if (session->room == NULL || session->room->members[0] != session) {
+    struct room *room = session->room;
+    if (command.type != GAME_COMMAND_NONE) {
+        if (room == NULL) {
             return ERR_UNAUTHORIZED;
+        }
+        if (!room->game.initialized) {
+            return ERR_WRONG_PHASE;
+        }
+        return game_handle_command(&room->game, session->id, now_ms, &command, events);
+    }
+    if (header->type == MSG_INVITE_REQ || header->type == MSG_KICK_REQ ||
+        header->type == MSG_START_GAME_REQ) {
+        if (room == NULL || room->members[0] != session) {
+            return ERR_UNAUTHORIZED;
+        }
+        if (room->game.initialized) {
+            return ERR_GAME_RUNNING;
+        }
+        if (header->type == MSG_START_GAME_REQ) {
+            return start_game(room, now_ms, events);
         }
         *target = header->type == MSG_INVITE_REQ
             ? find_invitee(lobby, name)
-            : find_kick_target(session->room, protocol_get_u32(body));
+            : find_kick_target(room, protocol_get_u32(body));
         return *target == NULL ? ERR_INVALID_TARGET : ERR_SUCCESS;
     }
-    if (session->room != NULL) {
+    if (room != NULL) {
         return ERR_UNAUTHORIZED;
     }
     switch (header->type) {
@@ -218,7 +303,119 @@ uint8_t lobby_handle_request(struct lobby *lobby, struct session *session,
     }
 }
 
-void lobby_finish_request(struct session *session, uint8_t type,
+static void send_game_event(const struct room *room, const struct game_event *event)
+{
+    struct message_header header = {0};
+    uint8_t body[PROTOCOL_MAX_BODY];
+    switch (event->type) {
+    case GAME_EVENT_ROLE_ASSIGN:
+        header.type = MSG_ROLE_ASSIGN;
+        header.length = 1;
+        body[0] = event->data.role_assign.role;
+        break;
+    case GAME_EVENT_WOLF_TEAM_INFO:
+        header.type = MSG_WOLF_TEAM_INFO;
+        body[0] = event->data.wolf_team_info.wolf_count;
+        header.length = 1 + 4 * body[0];
+        for (size_t i = 0; i < body[0]; ++i) {
+            protocol_put_u32(body + 1 + 4 * i, event->data.wolf_team_info.wolf_ids[i]);
+        }
+        break;
+    case GAME_EVENT_PHASE_CHANGE:
+        header.type = MSG_PHASE_CHANGE;
+        header.length = 11;
+        body[0] = event->data.phase_change.phase;
+        protocol_put_u16(body + 1, event->data.phase_change.duration_sec);
+        protocol_put_u64(body + 3, event->data.phase_change.deadline_ms);
+        break;
+    case GAME_EVENT_SEER_RESULT:
+        header.type = MSG_SEER_RESULT;
+        header.length = 5;
+        protocol_put_u32(body, event->data.seer_result.target_player_id);
+        body[4] = event->data.seer_result.is_werewolf;
+        break;
+    case GAME_EVENT_WOLF_TARGET_UPDATE:
+        header.type = MSG_WOLF_TARGET_UPDATE;
+        header.length = 8;
+        protocol_put_u32(body, event->data.wolf_target_update.wolf_id);
+        protocol_put_u32(body + 4, event->data.wolf_target_update.target_player_id);
+        break;
+    case GAME_EVENT_NIGHT_RESULT:
+        header.type = MSG_NIGHT_RESULT;
+        header.length = 4;
+        protocol_put_u32(body, event->data.night_result.killed_player_id);
+        break;
+    case GAME_EVENT_DAY_RESULT:
+        header.type = MSG_DAY_RESULT;
+        header.length = 4;
+        protocol_put_u32(body, event->data.day_result.executed_player_id);
+        break;
+    case GAME_EVENT_CHAT:
+        header.type = MSG_CHAT_NOTIF;
+        header.length = 5 + event->data.chat.message_length;
+        body[0] = event->data.chat.scope;
+        protocol_put_u32(body + 1, event->data.chat.from_player_id);
+        memcpy(body + 5, event->data.chat.message, event->data.chat.message_length);
+        break;
+    case GAME_EVENT_GAME_OVER:
+        header.type = MSG_GAME_OVER;
+        header.length = 1 + event->data.game_over.summary_length;
+        body[0] = event->data.game_over.winner;
+        memcpy(body + 1, event->data.game_over.summary,
+               event->data.game_over.summary_length);
+        break;
+    default:
+        return;
+    }
+
+    for (size_t i = 0; i < event->recipient_count; ++i) {
+        for (size_t j = 0; j < room->count; ++j) {
+            if (room->members[j]->id == event->recipient_ids[i]) {
+                session_queue_message(room->members[j], header, body);
+                break;
+            }
+        }
+    }
+}
+
+void lobby_send_game_events(struct room *room,
+                            const struct game_event_batch *events)
+{
+    for (size_t i = 0; i < events->count; ++i) {
+        send_game_event(room, &events->events[i]);
+    }
+    if (game_is_over(&room->game)) {
+        room->game = (struct game){0};
+        broadcast_room(room);
+    }
+}
+
+uint64_t lobby_next_game_deadline(const struct lobby *lobby)
+{
+    uint64_t next = UINT64_MAX;
+    for (size_t i = 0; i < MAX_SESSIONS; ++i) {
+        uint64_t deadline = game_next_deadline_ms(&lobby->rooms[i].game);
+        if (deadline < next) {
+            next = deadline;
+        }
+    }
+    return next;
+}
+
+void lobby_handle_game_timeouts(struct lobby *lobby, uint64_t now_ms)
+{
+    for (size_t i = 0; i < MAX_SESSIONS; ++i) {
+        struct room *room = &lobby->rooms[i];
+        if (game_next_deadline_ms(&room->game) <= now_ms) {
+            struct game_event_batch events = {0};
+            if (game_handle_timeout(&room->game, now_ms, &events) == GAME_RESULT_OK) {
+                lobby_send_game_events(room, &events);
+            }
+        }
+    }
+}
+
+void lobby_finish_request(struct session *session, uint8_t type, uint64_t now_ms,
                           struct session *target)
 {
     switch (type) {
@@ -227,7 +424,7 @@ void lobby_finish_request(struct session *session, uint8_t type,
         broadcast_room(session->room);
         break;
     case MSG_LEAVE_ROOM_REQ:
-        lobby_remove_session(session);
+        lobby_remove_session(session, now_ms);
         break;
     case MSG_INVITE_REQ: {
         uint8_t body[4 + 1 + PROTOCOL_MAX_NAME];
@@ -247,7 +444,7 @@ void lobby_finish_request(struct session *session, uint8_t type,
             .length = sizeof reason
         };
         session_queue_message(target, notice, &reason);
-        lobby_remove_session(target);
+        lobby_remove_session(target, now_ms);
         break;
     }
     }
